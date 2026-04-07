@@ -19,7 +19,7 @@ CFLAGS ?= -std=c99 -Wall -Wextra -Wpedantic -O2
 OPENMP_FLAGS ?= -fopenmp
 LDLIBS ?= -lm
 
-.PHONY: all clean bench_hashmap test_hashmap bench_hashmap_c
+.PHONY: all clean bench_hashmap test_hashmap bench_hashmap_c test_hashmap_c
 
 all: $(CPP_BENCH_TARGET) $(CPP_TEST_TARGET) $(C_TARGET) $(C_TEST_TARGET)
 
@@ -50,6 +50,6 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 clean:
-	rm -f $(CPP_BENCH_TARGET) $(CPP_TEST_TARGET) $(C_TARGET) $(CPP_OBJS) $(CPP_DEPS)
+	rm -f $(CPP_BENCH_TARGET) $(CPP_TEST_TARGET) $(C_TARGET) $(C_TEST_TARGET) $(CPP_OBJS) $(CPP_DEPS)
 
 -include $(CPP_DEPS)
