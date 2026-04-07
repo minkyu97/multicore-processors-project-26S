@@ -100,6 +100,22 @@ void ParallelHashTable<K, V, P>::clear() {
 }
 
 template <typename K, typename V, typename P>
+size_t ParallelHashTable<K, V, P>::size() const {
+    const K empty_key = static_cast<K>(EMPTY_KEY);
+    const K deleted_key = static_cast<K>(DELETED_KEY);
+    size_t occupied = 0;
+
+    for (size_t i = 0; i < capacity; ++i) {
+        const K current = table[i].key;
+        if (current != empty_key && current != deleted_key) {
+            ++occupied;
+        }
+    }
+
+    return occupied;
+}
+
+template <typename K, typename V, typename P>
 bool ParallelHashTable<K, V, P>::insert(K key, V value) {
     const K empty_key = static_cast<K>(EMPTY_KEY);
     const K deleted_key = static_cast<K>(DELETED_KEY);
@@ -324,6 +340,22 @@ void SequentialHashTable<K, V, P>::clear() {
     for (size_t i = 0; i < capacity; ++i) {
         reset_slot<typename SequentialHashTable<K, V, P>::Slot, K, V>(table[i]);
     }
+}
+
+template <typename K, typename V, typename P>
+size_t SequentialHashTable<K, V, P>::size() const {
+    const K empty_key = static_cast<K>(EMPTY_KEY);
+    const K deleted_key = static_cast<K>(DELETED_KEY);
+    size_t occupied = 0;
+
+    for (size_t i = 0; i < capacity; ++i) {
+        const K current = table[i].key;
+        if (current != empty_key && current != deleted_key) {
+            ++occupied;
+        }
+    }
+
+    return occupied;
 }
 
 template <typename K, typename V, typename P>

@@ -36,9 +36,6 @@ private:
     size_t num_threads;
     ParallelBackend backend;
 
-    // Internal Hashing Tool
-    size_t hash(K key) const;
-    
     // Internal Probing Tool (Linear or Quadratic)
     size_t next_slot(size_t start, int attempt) const;
 
@@ -49,6 +46,8 @@ public:
                       ParallelBackend backend = ParallelBackend::MUTEX);
     ~ParallelHashTable();
     void clear();
+    size_t hash(K key) const;
+    size_t size() const;
 
     // 2. Thread-Safe Single Operations
     // (If 10 threads call this simultaneously, the CAS/Mutex inside protects it)
@@ -74,13 +73,14 @@ private:
     Slot* table;
     size_t capacity;
 
-    size_t hash(K key) const;
     size_t next_slot(size_t start, int attempt) const;
 
 public:
     explicit SequentialHashTable(size_t size);
     ~SequentialHashTable();
     void clear();
+    size_t hash(K key) const;
+    size_t size() const;
 
     bool insert(K key, V value);
     bool get(K key, V& out_value);
