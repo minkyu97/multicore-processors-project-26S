@@ -179,78 +179,58 @@ void generate_keys(std::vector<int>& keys, std::vector<int>& values, int table_s
     }
 }
 
-std::vector<bool> count_finds_sequential(const std::vector<int>& keys,
-                                         const std::vector<int>& values,
-                                         int table_size,
-                                         int num_threads,
-                                         int probing) {
-    std::vector<bool> found(keys.size(), false);
-    const ParallelBackend backend = backend_for_mode(probing);
+template <typename Table>
+int run_sequential_ops(Table& table,
+                       const std::vector<int>& keys,
+                       const std::vector<int>& values) {
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        table.insert(keys[i], values[i]);
+    }
 
-    if (probing == PROBE_QUADRATIC) {
-        ParallelHashTable<int, int, ProbingStrategy::QUADRATIC> table(
-            table_size, num_threads, backend);
-        for (std::size_t i = 0; i < keys.size(); ++i) {
-            table.insert(keys[i], values[i]);
-        }
-        for (std::size_t i = 0; i < keys.size(); ++i) {
-            int out_value = 0;
-            found[i] = table.get(keys[i], out_value);
-        }
-    } else {
-        ParallelHashTable<int, int, ProbingStrategy::LINEAR> table(
-            table_size, num_threads, backend);
-        for (std::size_t i = 0; i < keys.size(); ++i) {
-            table.insert(keys[i], values[i]);
-        }
-        for (std::size_t i = 0; i < keys.size(); ++i) {
-            int out_value = 0;
-            found[i] = table.get(keys[i], out_value);
+    int found = 0;
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        int out_value = 0;
+        if (table.get(keys[i], out_value)) {
+            ++found;
         }
     }
 
     return found;
 }
 
-std::vector<bool> count_finds_parallel(const std::vector<int>& keys,
-                                       const std::vector<int>& values,
-                                       int table_size,
-                                       int num_threads,
-                                       int probing) {
-    std::vector<int> out_values;
-    std::vector<bool> found;
-    const ParallelBackend backend = backend_for_mode(probing);
+template <typename Probing>
+int run_parallel_ops(ParallelHashTable<int, int, Probing>& table,
+                     const std::vector<int>& keys,
+                     const std::vector<int>& values,
+                     int num_threads) {
+    table.insert_batch(keys, values);
 
-    if (probing == PROBE_QUADRATIC) {
-        ParallelHashTable<int, int, ProbingStrategy::QUADRATIC> table(
-            table_size, num_threads, backend);
-        table.insert_batch(keys, values);
-        table.get_batch(keys, out_values, found);
-    } else {
-        ParallelHashTable<int, int, ProbingStrategy::LINEAR> table(
-            table_size, num_threads, backend);
-        table.insert_batch(keys, values);
-        table.get_batch(keys, out_values, found);
+    int total_found = 0;
+    #pragma omp parallel for schedule(static) reduction(+:total_found) num_threads(num_threads)
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        int out_value = 0;
+        if (table.get(keys[i], out_value)) {
+            ++total_found;
+        }
     }
 
-    return found;
+    return total_found;
 }
 
-std::vector<bool> run_hash_ops(int which_code,
-                               int table_size,
-                               int num_threads,
-                               int probing,
-                               const std::vector<int>& keys,
-                               const std::vector<int>& values) {
-    if (which_code == 0) {
-        return count_finds_sequential(keys, values, table_size, 1, probing);
+template <typename Table>
+int count_mismatches(Table& table, const std::vector<int>& keys) {
+    int mismatches = 0;
+    for (int key : keys) {
+        int out_value = 0;
+        if (!table.get(key, out_value)) {
+            ++mismatches;
+        }
     }
-    return count_finds_parallel(keys, values, table_size, num_threads, probing);
+
+    return mismatches;
 }
 
-void check_result(const std::vector<bool>& found) {
-    const int mismatches = static_cast<int>(
-        std::count(found.begin(), found.end(), false));
+void check_result(int mismatches) {
     if (mismatches == 0) {
         std::printf("Result is correct!\n");
     } else {
@@ -258,12 +238,37 @@ void check_result(const std::vector<bool>& found) {
     }
 }
 
+template <typename Table, typename RunFn>
+int benchmark_table(Table& table,
+                    const std::vector<int>& keys,
+                    const std::vector<int>& values,
+                    int reps,
+                    const RunFn& run_ops,
+                    std::array<double, MAX_REPS>& times) {
+    std::printf("Running warm-up...\n");
+    table.clear();
+    int last_found = run_ops(table, keys, values);
+
+    std::printf("Running %d timed repetitions...\n", reps);
+    for (int rep = 0; rep < reps; ++rep) {
+        table.clear();
+        const double start = omp_get_wtime();
+        last_found = run_ops(table, keys, values);
+        const double end = omp_get_wtime();
+
+        times[rep] = end - start;
+        std::printf("  Rep %2d: %.6f seconds\n", rep + 1, times[rep]);
+    }
+
+    return last_found;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
     if (argc != 8) {
         std::fprintf(stderr,
-                     "usage: test_hashmap table_size num_ops who threads probing key_dist reps\n");
+                     "usage: bench_hashmap table_size num_ops who threads probing key_dist reps\n");
         std::fprintf(stderr,
                      "  table_size : slots in hash table (e.g. 1000000, 10000000)\n");
         std::fprintf(stderr, "  num_ops    : keys to insert/search\n");
@@ -310,24 +315,69 @@ int main(int argc, char* argv[]) {
     generate_keys(keys, values, table_size, key_dist);
 
     std::array<double, MAX_REPS> times{};
-    std::vector<bool> last_found;
+    int last_found_count = 0;
+    int mismatches = 0;
+    const bool use_quadratic = probing == PROBE_QUADRATIC;
 
-    std::printf("Running warm-up...\n");
-    last_found = run_hash_ops(which_code, table_size, num_threads, probing, keys, values);
+    if (which_code == 0) {
+        if (use_quadratic) {
+            SequentialHashTable<int, int, ProbingStrategy::QUADRATIC> table(table_size);
+            last_found_count = benchmark_table(
+                table,
+                keys,
+                values,
+                reps,
+                [](auto& current_table, const auto& current_keys, const auto& current_values) {
+                    return run_sequential_ops(current_table, current_keys, current_values);
+                },
+                times);
+        } else {
+            SequentialHashTable<int, int, ProbingStrategy::LINEAR> table(table_size);
+            last_found_count = benchmark_table(
+                table,
+                keys,
+                values,
+                reps,
+                [](auto& current_table, const auto& current_keys, const auto& current_values) {
+                    return run_sequential_ops(current_table, current_keys, current_values);
+                },
+                times);
+        }
+    } else {
+        const ParallelBackend backend = backend_for_mode(probing);
 
-    std::printf("Running %d timed repetitions...\n", reps);
-    for (int rep = 0; rep < reps; ++rep) {
-        const double start = omp_get_wtime();
-        last_found = run_hash_ops(which_code, table_size, num_threads, probing, keys, values);
-        const double end = omp_get_wtime();
+        if (use_quadratic) {
+            ParallelHashTable<int, int, ProbingStrategy::QUADRATIC> table(
+                table_size, num_threads, backend);
+            last_found_count = benchmark_table(
+                table,
+                keys,
+                values,
+                reps,
+                [num_threads](auto& current_table, const auto& current_keys, const auto& current_values) {
+                    return run_parallel_ops(current_table, current_keys, current_values, num_threads);
+                },
+                times);
+            mismatches = count_mismatches(table, keys);
+        } else {
+            ParallelHashTable<int, int, ProbingStrategy::LINEAR> table(
+                table_size, num_threads, backend);
+            last_found_count = benchmark_table(
+                table,
+                keys,
+                values,
+                reps,
+                [num_threads](auto& current_table, const auto& current_keys, const auto& current_values) {
+                    return run_parallel_ops(current_table, current_keys, current_values, num_threads);
+                },
+                times);
+            mismatches = count_mismatches(table, keys);
+        }
 
-        times[rep] = end - start;
-        std::printf("  Rep %2d: %.6f seconds\n", rep + 1, times[rep]);
+        check_result(mismatches);
     }
 
-    if (which_code == 1) {
-        check_result(last_found);
-    }
+    (void)last_found_count;
 
     const double raw_mean = mean(times, reps);
     const double trimmed = trimmed_mean(times, reps);

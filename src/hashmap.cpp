@@ -8,6 +8,31 @@
 #include <type_traits>
 #include <vector>
 
+namespace {
+    template <typename Slot, typename K, typename V>
+    void reset_slot(Slot& slot) {
+        slot.key = static_cast<K>(EMPTY_KEY);
+        if constexpr (std::is_constructible_v<V, int>) {
+            slot.value = static_cast<V>(EMPTY_KEY);
+        } else {
+            slot.value = V{};
+        }
+    }
+
+    template <typename K>
+    size_t hash_key(K key, size_t capacity) {
+        if constexpr (std::is_integral_v<K>) {
+            std::uint32_t k = static_cast<std::uint32_t>(key);
+            k = ((k >> 16) ^ k) * 0x45d9f3bu;
+            k = ((k >> 16) ^ k) * 0x45d9f3bu;
+            k = (k >> 16) ^ k;
+            return static_cast<size_t>(k) % capacity;
+        }
+
+        return std::hash<K>{}(key) % capacity;
+    }
+}
+
 namespace ProbingStrategy {
     size_t LINEAR::next_slot(size_t start, int attempt, size_t capacity) {
         return (start + attempt) % capacity;
@@ -20,15 +45,7 @@ namespace ProbingStrategy {
 
 template <typename K, typename V, typename P>
 size_t ParallelHashTable<K, V, P>::hash(K key) const {
-    if constexpr (std::is_integral_v<K>) {
-        std::uint32_t k = static_cast<std::uint32_t>(key);
-        k = ((k >> 16) ^ k) * 0x45d9f3bu;
-        k = ((k >> 16) ^ k) * 0x45d9f3bu;
-        k = (k >> 16) ^ k;
-        return static_cast<size_t>(k) % capacity;
-    }
-
-    return std::hash<K>{}(key) % capacity;
+    return hash_key(key, capacity);
 }
 
 template <typename K, typename V, typename P>
@@ -56,13 +73,8 @@ ParallelHashTable<K, V, P>::ParallelHashTable(size_t size,
 
     table = new Slot[capacity];
     locks = backend == ParallelBackend::MUTEX ? new omp_lock_t[capacity] : nullptr;
+    clear();
     for (size_t i = 0; i < capacity; ++i) {
-        table[i].key = EMPTY_KEY;
-        if constexpr (std::is_constructible_v<V, int>) {
-            table[i].value = static_cast<V>(EMPTY_KEY);
-        } else {
-            table[i].value = V{};
-        }
         if (locks != nullptr) {
             omp_init_lock(&locks[i]);
         }
@@ -78,6 +90,13 @@ ParallelHashTable<K, V, P>::~ParallelHashTable() {
         delete[] locks;
     }
     delete[] table;
+}
+
+template <typename K, typename V, typename P>
+void ParallelHashTable<K, V, P>::clear() {
+    for (size_t i = 0; i < capacity; ++i) {
+        reset_slot<typename ParallelHashTable<K, V, P>::Slot, K, V>(table[i]);
+    }
 }
 
 template <typename K, typename V, typename P>
@@ -274,5 +293,111 @@ void ParallelHashTable<K, V, P>::remove_batch(const std::vector<K>& keys) {
     }
 }
 
+template <typename K, typename V, typename P>
+size_t SequentialHashTable<K, V, P>::hash(K key) const {
+    return hash_key(key, capacity);
+}
+
+template <typename K, typename V, typename P>
+size_t SequentialHashTable<K, V, P>::next_slot(size_t start, int attempt) const {
+    return P::next_slot(start, attempt, capacity);
+}
+
+template <typename K, typename V, typename P>
+SequentialHashTable<K, V, P>::SequentialHashTable(size_t size) {
+    if (size == 0) {
+        throw std::invalid_argument("hash table size must be greater than zero");
+    }
+
+    capacity = size;
+    table = new Slot[capacity];
+    clear();
+}
+
+template <typename K, typename V, typename P>
+SequentialHashTable<K, V, P>::~SequentialHashTable() {
+    delete[] table;
+}
+
+template <typename K, typename V, typename P>
+void SequentialHashTable<K, V, P>::clear() {
+    for (size_t i = 0; i < capacity; ++i) {
+        reset_slot<typename SequentialHashTable<K, V, P>::Slot, K, V>(table[i]);
+    }
+}
+
+template <typename K, typename V, typename P>
+bool SequentialHashTable<K, V, P>::insert(K key, V value) {
+    const K empty_key = static_cast<K>(EMPTY_KEY);
+    const K deleted_key = static_cast<K>(DELETED_KEY);
+    size_t index = hash(key);
+
+    for (int attempt = 0; static_cast<size_t>(attempt) < capacity; ++attempt) {
+        size_t slot_index = next_slot(index, attempt);
+        const K current = table[slot_index].key;
+
+        if (current == empty_key || current == deleted_key) {
+            table[slot_index].key = key;
+            table[slot_index].value = value;
+            return true;
+        }
+        if (current == key) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+template <typename K, typename V, typename P>
+bool SequentialHashTable<K, V, P>::get(K key, V& out_value) {
+    const K empty_key = static_cast<K>(EMPTY_KEY);
+    size_t index = hash(key);
+
+    for (int attempt = 0; static_cast<size_t>(attempt) < capacity; ++attempt) {
+        size_t slot_index = next_slot(index, attempt);
+        const K current = table[slot_index].key;
+
+        if (current == empty_key) {
+            return false;
+        }
+        if (current == key) {
+            out_value = table[slot_index].value;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+template <typename K, typename V, typename P>
+bool SequentialHashTable<K, V, P>::remove(K key) {
+    const K empty_key = static_cast<K>(EMPTY_KEY);
+    const K deleted_key = static_cast<K>(DELETED_KEY);
+    size_t index = hash(key);
+
+    for (int attempt = 0; static_cast<size_t>(attempt) < capacity; ++attempt) {
+        size_t slot_index = next_slot(index, attempt);
+        const K current = table[slot_index].key;
+
+        if (current == empty_key) {
+            return false;
+        }
+        if (current == key) {
+            table[slot_index].key = deleted_key;
+            if constexpr (std::is_constructible_v<V, int>) {
+                table[slot_index].value = static_cast<V>(DELETED_KEY);
+            } else {
+                table[slot_index].value = V{};
+            }
+            return true;
+        }
+    }
+
+    return false;
+}
+
 template class ParallelHashTable<int, int, ProbingStrategy::LINEAR>;
 template class ParallelHashTable<int, int, ProbingStrategy::QUADRATIC>;
+template class SequentialHashTable<int, int, ProbingStrategy::LINEAR>;
+template class SequentialHashTable<int, int, ProbingStrategy::QUADRATIC>;
