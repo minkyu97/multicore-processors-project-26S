@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 
-resolve_bench_bin() {
+resolve_cmake_binary() {
     local root_dir="$1"
-    local requested_bin="${2:-}"
+    local target_name="$2"
+    local requested_bin="${3:-}"
 
     if [[ -n "$requested_bin" ]]; then
         if [[ ! -x "$requested_bin" ]]; then
-            echo "bench_hashmap binary is not executable: $requested_bin" >&2
+            echo "$target_name binary is not executable: $requested_bin" >&2
             return 1
         fi
         printf '%s\n' "$requested_bin"
@@ -14,8 +15,8 @@ resolve_bench_bin() {
     fi
 
     local candidates=(
-        "$root_dir/build/src/bench_hashmap"
-        "$root_dir/build/bench_hashmap"
+        "$root_dir/build/src/$target_name"
+        "$root_dir/build/$target_name"
     )
 
     local candidate=""
@@ -27,8 +28,8 @@ resolve_bench_bin() {
     done
 
     if [[ -d "$root_dir/build" ]]; then
-        echo "bench_hashmap binary not found. Building target..." >&2
-        cmake --build "$root_dir/build" --target bench_hashmap >&2
+        echo "$target_name binary not found. Building target..." >&2
+        cmake --build "$root_dir/build" --target "$target_name" >&2
         for candidate in "${candidates[@]}"; do
             if [[ -x "$candidate" ]]; then
                 printf '%s\n' "$candidate"
@@ -37,8 +38,14 @@ resolve_bench_bin() {
         done
     fi
 
-    echo "Could not find bench_hashmap. Use --bench-bin or build the target first." >&2
+    echo "Could not find $target_name. Build the target first or pass an explicit path." >&2
     return 1
+}
+
+resolve_bench_bin() {
+    local root_dir="$1"
+    local requested_bin="${2:-}"
+    resolve_cmake_binary "$root_dir" "bench_hashmap" "$requested_bin"
 }
 
 extract_metric() {
