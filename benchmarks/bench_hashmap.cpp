@@ -11,8 +11,10 @@ namespace {
 
 constexpr int PROBE_LINEAR = 0;
 constexpr int PROBE_QUADRATIC = 1;
-constexpr int PROBE_CAS = 2;
-constexpr int PROBE_MUTEX = 3;
+
+constexpr int IMPL_SEQUENTIAL = 0;
+constexpr int IMPL_PARALLEL_CAS = 1;
+constexpr int IMPL_PARALLEL_MUTEX = 2;
 
 constexpr int KEYS_SEQUENTIAL = 0;
 constexpr int KEYS_RANDOM = 1;
@@ -88,13 +90,22 @@ double trimmed_mean(const std::array<double, MAX_REPS>& values, int count) {
 const char* probe_name(int probing) {
     switch (probing) {
         case PROBE_LINEAR:
-            return "Linear probing (CAS)";
+            return "Linear";
         case PROBE_QUADRATIC:
-            return "Quadratic probing (CAS)";
-        case PROBE_CAS:
-            return "CAS lock-free (linear)";
-        case PROBE_MUTEX:
-            return "Mutex locking (linear)";
+            return "Quadratic";
+        default:
+            return "Unknown";
+    }
+}
+
+const char* implementation_name(int implementation) {
+    switch (implementation) {
+        case IMPL_SEQUENTIAL:
+            return "Sequential";
+        case IMPL_PARALLEL_CAS:
+            return "Parallel (CAS)";
+        case IMPL_PARALLEL_MUTEX:
+            return "Parallel (mutex)";
         default:
             return "Unknown";
     }
@@ -113,8 +124,9 @@ const char* dist_name(int key_dist) {
     }
 }
 
-ParallelBackend backend_for_mode(int probing) {
-    return probing == PROBE_MUTEX ? ParallelBackend::MUTEX : ParallelBackend::CAS;
+ParallelBackend backend_for_mode(int implementation) {
+    return implementation == IMPL_PARALLEL_MUTEX ? ParallelBackend::MUTEX
+                                                 : ParallelBackend::CAS;
 }
 
 void generate_keys(std::vector<int>& keys, std::vector<int>& values, int table_size, int dist) {
@@ -272,9 +284,9 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr,
                      "  table_size : slots in hash table (e.g. 1000000, 10000000)\n");
         std::fprintf(stderr, "  num_ops    : keys to insert/search\n");
-        std::fprintf(stderr, "  who        : 0=sequential, 1=parallel\n");
+        std::fprintf(stderr, "  who        : 0=sequential, 1=parallel-cas, 2=parallel-mutex\n");
         std::fprintf(stderr, "  threads    : 1,2,4,8,16,32,64\n");
-        std::fprintf(stderr, "  probing    : 0=linear, 1=quadratic, 2=CAS, 3=mutex\n");
+        std::fprintf(stderr, "  probing    : 0=linear, 1=quadratic\n");
         std::fprintf(stderr, "  key_dist   : 0=sequential, 1=random, 2=zipf\n");
         std::fprintf(stderr, "  reps       : repetitions (recommended: 7)\n");
         return 1;
@@ -292,6 +304,14 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr, "reps must be between 1 and %d\n", MAX_REPS);
         return 1;
     }
+    if (which_code < IMPL_SEQUENTIAL || which_code > IMPL_PARALLEL_MUTEX) {
+        std::fprintf(stderr, "who must be 0, 1, or 2\n");
+        return 1;
+    }
+    if (probing != PROBE_LINEAR && probing != PROBE_QUADRATIC) {
+        std::fprintf(stderr, "probing must be 0 or 1\n");
+        return 1;
+    }
     if (num_ops >= table_size) {
         std::fprintf(stderr, "num_ops must be < table_size\n");
         return 1;
@@ -304,6 +324,7 @@ int main(int argc, char* argv[]) {
     std::printf("Table size  : %d\n", table_size);
     std::printf("Operations  : %d\n", num_ops);
     std::printf("Load factor : %.2f (%.0f%%)\n", load_factor, load_factor * 100.0f);
+    std::printf("Implementation: %s\n", implementation_name(which_code));
     std::printf("Threads     : %d\n", num_threads);
     std::printf("Probing     : %s\n", probe_name(probing));
     std::printf("Key dist    : %s\n", dist_name(key_dist));
@@ -319,7 +340,7 @@ int main(int argc, char* argv[]) {
     int mismatches = 0;
     const bool use_quadratic = probing == PROBE_QUADRATIC;
 
-    if (which_code == 0) {
+    if (which_code == IMPL_SEQUENTIAL) {
         if (use_quadratic) {
             SequentialHashTable<int, int, ProbingStrategy::QUADRATIC> table(table_size);
             last_found_count = benchmark_table(
@@ -344,7 +365,7 @@ int main(int argc, char* argv[]) {
                 times);
         }
     } else {
-        const ParallelBackend backend = backend_for_mode(probing);
+        const ParallelBackend backend = backend_for_mode(which_code);
 
         if (use_quadratic) {
             ParallelHashTable<int, int, ProbingStrategy::QUADRATIC> table(

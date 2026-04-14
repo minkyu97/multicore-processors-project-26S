@@ -1,14 +1,14 @@
-#include <omp.h>
-#include "hashtable.hpp"
+#pragma once
+
+#include "openmp_hash_table/hashtable.hpp"
 
 #include <atomic>
 #include <cstdint>
 #include <functional>
 #include <stdexcept>
 #include <type_traits>
-#include <vector>
 
-namespace {
+namespace openmp_hash_table_detail {
     template <typename Slot, typename K, typename V>
     void reset_slot(Slot& slot) {
         slot.key = static_cast<K>(EMPTY_KEY);
@@ -34,18 +34,18 @@ namespace {
 }
 
 namespace ProbingStrategy {
-    size_t LINEAR::next_slot(size_t start, int attempt, size_t capacity) {
+    inline size_t LINEAR::next_slot(size_t start, int attempt, size_t capacity) {
         return (start + attempt) % capacity;
     }
 
-    size_t QUADRATIC::next_slot(size_t start, int attempt, size_t capacity) {
+    inline size_t QUADRATIC::next_slot(size_t start, int attempt, size_t capacity) {
         return (start + attempt * attempt) % capacity;
     }
 }
 
 template <typename K, typename V, typename P>
 size_t ParallelHashTable<K, V, P>::hash(K key) const {
-    return hash_key(key, capacity);
+    return openmp_hash_table_detail::hash_key(key, capacity);
 }
 
 template <typename K, typename V, typename P>
@@ -95,7 +95,7 @@ ParallelHashTable<K, V, P>::~ParallelHashTable() {
 template <typename K, typename V, typename P>
 void ParallelHashTable<K, V, P>::clear() {
     for (size_t i = 0; i < capacity; ++i) {
-        reset_slot<typename ParallelHashTable<K, V, P>::Slot, K, V>(table[i]);
+        openmp_hash_table_detail::reset_slot<typename ParallelHashTable<K, V, P>::Slot, K, V>(table[i]);
     }
 }
 
@@ -311,7 +311,7 @@ void ParallelHashTable<K, V, P>::remove_batch(const std::vector<K>& keys) {
 
 template <typename K, typename V, typename P>
 size_t SequentialHashTable<K, V, P>::hash(K key) const {
-    return hash_key(key, capacity);
+    return openmp_hash_table_detail::hash_key(key, capacity);
 }
 
 template <typename K, typename V, typename P>
@@ -338,7 +338,7 @@ SequentialHashTable<K, V, P>::~SequentialHashTable() {
 template <typename K, typename V, typename P>
 void SequentialHashTable<K, V, P>::clear() {
     for (size_t i = 0; i < capacity; ++i) {
-        reset_slot<typename SequentialHashTable<K, V, P>::Slot, K, V>(table[i]);
+        openmp_hash_table_detail::reset_slot<typename SequentialHashTable<K, V, P>::Slot, K, V>(table[i]);
     }
 }
 
@@ -428,8 +428,3 @@ bool SequentialHashTable<K, V, P>::remove(K key) {
 
     return false;
 }
-
-template class ParallelHashTable<int, int, ProbingStrategy::LINEAR>;
-template class ParallelHashTable<int, int, ProbingStrategy::QUADRATIC>;
-template class SequentialHashTable<int, int, ProbingStrategy::LINEAR>;
-template class SequentialHashTable<int, int, ProbingStrategy::QUADRATIC>;

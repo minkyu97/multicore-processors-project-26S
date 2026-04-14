@@ -15,8 +15,10 @@ resolve_cmake_binary() {
     fi
 
     local candidates=(
-        "$root_dir/build/src/$target_name"
+        "$root_dir/build/bin/$target_name"
         "$root_dir/build/$target_name"
+        "$root_dir/build/benchmarks/$target_name"
+        "$root_dir/build/tests/$target_name"
     )
 
     local candidate=""
