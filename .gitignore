@@ -4,3 +4,5 @@ build/
 .DS_Store
 CMakeUserPresets.json
 benchmark_results/
+out/
+*.zip
