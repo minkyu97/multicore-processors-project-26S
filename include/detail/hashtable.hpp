@@ -2,12 +2,12 @@
 
 #include <algorithm>
 #include <atomic>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -35,7 +35,16 @@ enum class ParallelBackend {
 namespace openmp_hash_table_detail {
     constexpr size_t kLoadNumerator = 7;
     constexpr size_t kLoadDenominator = 10;
-    constexpr int kBusyKey = -3;
+    constexpr size_t kMigrationChunkSize = 64;
+
+    enum class SlotState : std::uint8_t {
+        Empty = 0,
+        Claimed = 1,
+        Occupied = 2,
+        Deleted = 3,
+        Moving = 4,
+        Moved = 5,
+    };
 
     enum class InsertStatus {
         InsertedNew,
@@ -53,11 +62,6 @@ namespace openmp_hash_table_detail {
     template <typename K>
     K deleted_key() {
         return static_cast<K>(DELETED_KEY);
-    }
-
-    template <typename K>
-    K busy_key() {
-        return static_cast<K>(kBusyKey);
     }
 
     template <typename V>
@@ -82,6 +86,16 @@ namespace openmp_hash_table_detail {
     void mark_deleted_slot(Slot& slot) {
         slot.key = deleted_key<K>();
         slot.value = deleted_value<V>();
+    }
+
+    inline bool is_readable_state(SlotState state) {
+        return state == SlotState::Occupied ||
+            state == SlotState::Moving ||
+            state == SlotState::Moved;
+    }
+
+    inline bool is_probe_terminal_state(SlotState state) {
+        return state == SlotState::Empty;
     }
 
     template <typename K>
@@ -138,10 +152,14 @@ private:
 
     struct TableState {
         Slot* table;
+        std::atomic<std::uint8_t>* meta;
         omp_lock_t* locks;
         size_t capacity;
         std::atomic<size_t> occupied;
         std::atomic<size_t> deleted;
+        std::atomic<size_t> active_refs;
+        std::atomic<size_t> active_mutators;
+        std::atomic<bool> sealed_for_new_writes;
 
         TableState(size_t capacity, ParallelBackend backend);
         ~TableState();
@@ -150,53 +168,95 @@ private:
         TableState& operator=(const TableState&) = delete;
     };
 
+    struct ResizeContext {
+        TableState* source;
+        TableState* target;
+        std::atomic<size_t> claim_cursor;
+        std::atomic<size_t> remaining_slots;
+        std::atomic<size_t> active_refs;
+
+        ResizeContext(TableState* source_table, TableState* target_table);
+
+        ResizeContext(const ResizeContext&) = delete;
+        ResizeContext& operator=(const ResizeContext&) = delete;
+    };
+
+    struct OperationSnapshot {
+        TableState* state;
+        ResizeContext* resize;
+    };
+
     class OperationGuard {
     public:
         explicit OperationGuard(const ParallelHashTable& owner)
-            : owner_(owner), state_(owner.enter_operation()) {}
+            : owner_(owner), snapshot_(owner.enter_operation()) {}
 
         ~OperationGuard() {
-            owner_.leave_operation();
+            owner_.leave_operation(snapshot_);
         }
 
         TableState* state() const {
-            return state_;
+            return snapshot_.state;
+        }
+
+        ResizeContext* resize() const {
+            return snapshot_.resize;
         }
 
     private:
         const ParallelHashTable& owner_;
-        TableState* state_;
+        OperationSnapshot snapshot_;
     };
 
     std::atomic<TableState*> state_;
+    std::atomic<ResizeContext*> resize_ctx_;
     size_t num_threads_;
     ParallelBackend backend_;
-    mutable size_t active_operations_;
-    mutable bool resize_gate_closed_;
-    mutable std::mutex gate_mutex_;
-    mutable std::condition_variable gate_cv_;
-    mutable std::condition_variable idle_cv_;
+    std::atomic<size_t> live_items_;
+    std::atomic<size_t> pending_resize_capacity_;
+    std::atomic<bool> maintenance_mode_;
     std::mutex resize_mutex_;
+    std::vector<ResizeContext*> retired_resize_;
 
     size_t next_slot(size_t start, int attempt, size_t capacity) const;
-    TableState* enter_operation() const;
-    void leave_operation() const;
-    void close_gate_and_wait_for_quiescence();
-    void open_gate();
+    OperationSnapshot enter_operation() const;
+    void leave_operation(const OperationSnapshot& snapshot) const;
     void reset_state(TableState* state);
-    void rebuild_state(TableState* source, TableState* target);
+    void reset_pending_resize_request(size_t minimum_capacity = 0);
+    void record_pending_resize_request(size_t requested_capacity);
+    size_t consume_pending_resize_request();
+    void reclaim_retired_resize_contexts();
+    void wait_for_write_quiescence(TableState* state) const;
+    void wait_for_all_operations_to_finish() const;
+    bool begin_mutation(TableState* state) const;
+    void end_mutation(TableState* state) const;
+    bool wait_for_claimed_slot(const TableState* state, size_t slot_index) const;
+    openmp_hash_table_detail::SlotState load_state(const TableState* state, size_t slot_index) const;
+    void store_state(TableState* state, size_t slot_index, openmp_hash_table_detail::SlotState state_value) const;
+    bool compare_exchange_state(TableState* state,
+                                size_t slot_index,
+                                openmp_hash_table_detail::SlotState expected,
+                                openmp_hash_table_detail::SlotState desired) const;
+    size_t resolved_resize_capacity(const TableState* state,
+                                    size_t requested_capacity,
+                                    bool force_rebuild) const;
+    void maybe_finish_resize(ResizeContext* ctx);
+    void help_resize(ResizeContext* ctx, size_t chunk_size = openmp_hash_table_detail::kMigrationChunkSize);
+    void move_slot(ResizeContext* ctx, size_t slot_index);
+    bool claim_slot_for_migration(TableState* source, size_t slot_index);
+    void publish_resize(TableState* source, TableState* target);
+    openmp_hash_table_detail::InsertStatus insert_migrated_entry(TableState* state, K key, const V& value);
     void maybe_resize(size_t requested_capacity, bool force_rebuild);
-    void reinsert_live_entry(TableState* state, K key, const V& value);
-    bool try_claim_slot(TableState* state, size_t slot_index, K expected_marker, K key, const V& value);
     openmp_hash_table_detail::InsertStatus insert_into_state(TableState* state, K key, const V& value);
     openmp_hash_table_detail::InsertStatus insert_with_cas(TableState* state, K key, const V& value);
     openmp_hash_table_detail::InsertStatus insert_with_mutex(TableState* state, K key, const V& value);
-    bool get_from_state(TableState* state, K key, V& out_value) const;
-    bool get_with_cas(TableState* state, K key, V& out_value) const;
-    bool get_with_mutex(TableState* state, K key, V& out_value) const;
-    bool remove_from_state(TableState* state, K key);
-    bool remove_with_cas(TableState* state, K key);
-    bool remove_with_mutex(TableState* state, K key);
+    bool get_from_state(TableState* state, K key, V& out_value, bool include_moved_states) const;
+    bool get_with_cas(TableState* state, K key, V& out_value, bool include_moved_states) const;
+    bool get_with_mutex(TableState* state, K key, V& out_value, bool include_moved_states) const;
+    bool contains_in_state(TableState* state, K key, bool include_moved_states) const;
+    bool remove_from_state(TableState* state, K key, bool allow_moved_redirect);
+    bool remove_with_cas(TableState* state, K key, bool allow_moved_redirect);
+    bool remove_with_mutex(TableState* state, K key, bool allow_moved_redirect);
     void validate_insert_key(K key) const;
 
 public:
@@ -544,45 +604,60 @@ bool SequentialHashTable<K, V, P>::remove(K key) {
 }
 
 template <typename K, typename V, typename P>
-ParallelHashTable<K, V, P>::TableState::TableState(size_t requested_capacity, ParallelBackend /*backend*/)
+ParallelHashTable<K, V, P>::TableState::TableState(size_t requested_capacity, ParallelBackend backend)
     : table(new Slot[requested_capacity]),
-      locks(new omp_lock_t[requested_capacity]),
+      meta(new std::atomic<std::uint8_t>[requested_capacity]),
+      locks(backend == ParallelBackend::MUTEX ? new omp_lock_t[requested_capacity] : nullptr),
       capacity(requested_capacity),
       occupied(0),
-      deleted(0) {
+      deleted(0),
+      active_refs(0),
+      active_mutators(0),
+      sealed_for_new_writes(false) {
     for (size_t i = 0; i < capacity; ++i) {
         openmp_hash_table_detail::reset_slot<Slot, K, V>(table[i]);
-        omp_init_lock(&locks[i]);
+        meta[i].store(static_cast<std::uint8_t>(openmp_hash_table_detail::SlotState::Empty),
+                      std::memory_order_relaxed);
+        if (locks != nullptr) {
+            omp_init_lock(&locks[i]);
+        }
     }
 }
 
 template <typename K, typename V, typename P>
 ParallelHashTable<K, V, P>::TableState::~TableState() {
-    for (size_t i = 0; i < capacity; ++i) {
-        omp_destroy_lock(&locks[i]);
+    if (locks != nullptr) {
+        for (size_t i = 0; i < capacity; ++i) {
+            omp_destroy_lock(&locks[i]);
+        }
+        delete[] locks;
     }
-    delete[] locks;
+    delete[] meta;
     delete[] table;
 }
+
+template <typename K, typename V, typename P>
+ParallelHashTable<K, V, P>::ResizeContext::ResizeContext(TableState* source_table,
+                                                         TableState* target_table)
+    : source(source_table),
+      target(target_table),
+      claim_cursor(0),
+      remaining_slots(source_table->capacity),
+      active_refs(0) {}
 
 template <typename K, typename V, typename P>
 ParallelHashTable<K, V, P>::ParallelHashTable(size_t size,
                                               size_t num_threads,
                                               ParallelBackend backend)
     : state_(nullptr),
+      resize_ctx_(nullptr),
       num_threads_(num_threads == 0 ? omp_get_max_threads() : num_threads),
       backend_(backend),
-      active_operations_(0),
-      resize_gate_closed_(false) {
+      live_items_(0),
+      pending_resize_capacity_(0),
+      maintenance_mode_(false) {
     if (size == 0) {
         throw std::invalid_argument("hash table size must be greater than zero");
-    }
-
-    if (backend_ == ParallelBackend::CAS) {
-        if constexpr (!std::is_trivially_copyable_v<K> || !std::is_constructible_v<K, int>) {
-            throw std::invalid_argument(
-                "CAS backend requires trivially copyable keys that support sentinel values");
-        }
     }
 
     state_.store(new TableState(size, backend_), std::memory_order_release);
@@ -590,7 +665,29 @@ ParallelHashTable<K, V, P>::ParallelHashTable(size_t size,
 
 template <typename K, typename V, typename P>
 ParallelHashTable<K, V, P>::~ParallelHashTable() {
-    delete state_.load(std::memory_order_acquire);
+    maintenance_mode_.store(true, std::memory_order_release);
+    wait_for_all_operations_to_finish();
+    std::unique_lock<std::mutex> resize_lock(resize_mutex_);
+    while (!retired_resize_.empty()) {
+        reclaim_retired_resize_contexts();
+        if (retired_resize_.empty()) {
+            break;
+        }
+        resize_lock.unlock();
+        std::this_thread::yield();
+        resize_lock.lock();
+    }
+
+    ResizeContext* ctx = resize_ctx_.exchange(nullptr, std::memory_order_acq_rel);
+    TableState* current = state_.exchange(nullptr, std::memory_order_acq_rel);
+    if (ctx != nullptr) {
+        if (ctx->source != current) {
+            delete ctx->source;
+        }
+        delete ctx->target;
+        delete ctx;
+    }
+    delete current;
 }
 
 template <typename K, typename V, typename P>
@@ -604,200 +701,128 @@ void ParallelHashTable<K, V, P>::validate_insert_key(K key) const {
         key == openmp_hash_table_detail::deleted_key<K>()) {
         throw std::invalid_argument("insert key collides with reserved sentinel value");
     }
-    if (backend_ == ParallelBackend::CAS && key == openmp_hash_table_detail::busy_key<K>()) {
-        throw std::invalid_argument("insert key collides with reserved CAS marker");
+}
+
+template <typename K, typename V, typename P>
+typename ParallelHashTable<K, V, P>::OperationSnapshot ParallelHashTable<K, V, P>::enter_operation() const {
+    for (;;) {
+        while (maintenance_mode_.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+
+        ResizeContext* ctx = resize_ctx_.load(std::memory_order_acquire);
+        if (ctx != nullptr) {
+            ctx->active_refs.fetch_add(1, std::memory_order_acq_rel);
+            if (!maintenance_mode_.load(std::memory_order_acquire) &&
+                resize_ctx_.load(std::memory_order_acquire) == ctx) {
+                return OperationSnapshot{ctx->target, ctx};
+            }
+            ctx->active_refs.fetch_sub(1, std::memory_order_acq_rel);
+            continue;
+        }
+
+        TableState* state = state_.load(std::memory_order_acquire);
+        state->active_refs.fetch_add(1, std::memory_order_acq_rel);
+        if (!maintenance_mode_.load(std::memory_order_acquire) &&
+            resize_ctx_.load(std::memory_order_acquire) == nullptr &&
+            state_.load(std::memory_order_acquire) == state) {
+            return OperationSnapshot{state, nullptr};
+        }
+        state->active_refs.fetch_sub(1, std::memory_order_acq_rel);
     }
 }
 
 template <typename K, typename V, typename P>
-typename ParallelHashTable<K, V, P>::TableState* ParallelHashTable<K, V, P>::enter_operation() const {
-    std::unique_lock<std::mutex> lock(gate_mutex_);
-    gate_cv_.wait(lock, [this] {
-        return !resize_gate_closed_;
-    });
-
-    ++active_operations_;
-    return state_.load(std::memory_order_acquire);
-}
-
-template <typename K, typename V, typename P>
-void ParallelHashTable<K, V, P>::leave_operation() const {
-    std::lock_guard<std::mutex> lock(gate_mutex_);
-    --active_operations_;
-    if (resize_gate_closed_ && active_operations_ == 0) {
-        idle_cv_.notify_all();
+void ParallelHashTable<K, V, P>::leave_operation(const OperationSnapshot& snapshot) const {
+    if (snapshot.resize != nullptr) {
+        snapshot.resize->active_refs.fetch_sub(1, std::memory_order_acq_rel);
+        return;
     }
-}
 
-template <typename K, typename V, typename P>
-void ParallelHashTable<K, V, P>::close_gate_and_wait_for_quiescence() {
-    std::unique_lock<std::mutex> lock(gate_mutex_);
-    resize_gate_closed_ = true;
-    idle_cv_.wait(lock, [this] {
-        return active_operations_ == 0;
-    });
-}
-
-template <typename K, typename V, typename P>
-void ParallelHashTable<K, V, P>::open_gate() {
-    {
-        std::lock_guard<std::mutex> lock(gate_mutex_);
-        resize_gate_closed_ = false;
-    }
-    gate_cv_.notify_all();
+    snapshot.state->active_refs.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 template <typename K, typename V, typename P>
 void ParallelHashTable<K, V, P>::reset_state(TableState* state) {
     for (size_t i = 0; i < state->capacity; ++i) {
         openmp_hash_table_detail::reset_slot<Slot, K, V>(state->table[i]);
+        state->meta[i].store(static_cast<std::uint8_t>(openmp_hash_table_detail::SlotState::Empty),
+                             std::memory_order_relaxed);
     }
     state->occupied.store(0, std::memory_order_relaxed);
     state->deleted.store(0, std::memory_order_relaxed);
 }
 
 template <typename K, typename V, typename P>
-void ParallelHashTable<K, V, P>::reinsert_live_entry(TableState* state, K key, const V& value) {
-    const K empty_key = openmp_hash_table_detail::empty_key<K>();
-    const size_t start = openmp_hash_table_detail::hash_key(key, state->capacity);
-
-    for (int attempt = 0; static_cast<size_t>(attempt) < state->capacity; ++attempt) {
-        const size_t slot_index = next_slot(start, attempt, state->capacity);
-        if (state->table[slot_index].key == empty_key) {
-            state->table[slot_index].key = key;
-            state->table[slot_index].value = value;
-            return;
-        }
-    }
-
-    throw std::runtime_error("rehash target capacity is too small");
+void ParallelHashTable<K, V, P>::reset_pending_resize_request(size_t minimum_capacity) {
+    pending_resize_capacity_.store(minimum_capacity, std::memory_order_release);
 }
 
 template <typename K, typename V, typename P>
-void ParallelHashTable<K, V, P>::rebuild_state(TableState* source, TableState* target) {
-    size_t occupied = 0;
-    const K empty_key = openmp_hash_table_detail::empty_key<K>();
-    const K deleted_key = openmp_hash_table_detail::deleted_key<K>();
-    const K busy_key = openmp_hash_table_detail::busy_key<K>();
-
-    for (size_t i = 0; i < source->capacity; ++i) {
-        K current = source->table[i].key;
-        while (backend_ == ParallelBackend::CAS && current == busy_key) {
-            auto key_ref = std::atomic_ref<K>(source->table[i].key);
-            current = key_ref.load(std::memory_order_acquire);
-        }
-        if (current != empty_key && current != deleted_key) {
-            reinsert_live_entry(target, current, source->table[i].value);
-            ++occupied;
-        }
+void ParallelHashTable<K, V, P>::record_pending_resize_request(size_t requested_capacity) {
+    size_t current = pending_resize_capacity_.load(std::memory_order_acquire);
+    while (current < requested_capacity &&
+           !pending_resize_capacity_.compare_exchange_weak(
+               current,
+               requested_capacity,
+               std::memory_order_acq_rel,
+               std::memory_order_acquire)) {
     }
-
-    target->occupied.store(occupied, std::memory_order_relaxed);
-    target->deleted.store(0, std::memory_order_relaxed);
 }
 
 template <typename K, typename V, typename P>
-void ParallelHashTable<K, V, P>::maybe_resize(size_t requested_capacity, bool force_rebuild) {
-    TableState* snapshot = state_.load(std::memory_order_acquire);
-    size_t occupied = snapshot->occupied.load(std::memory_order_relaxed);
-    size_t deleted = snapshot->deleted.load(std::memory_order_relaxed);
-    size_t target_capacity = snapshot->capacity;
-    bool should_rebuild = force_rebuild;
-
-    if (force_rebuild) {
-        target_capacity = std::max(
-            requested_capacity, openmp_hash_table_detail::min_capacity_for_items(occupied));
-    } else {
-        if (requested_capacity > snapshot->capacity) {
-            target_capacity = requested_capacity;
-            should_rebuild = true;
-        }
-        if (!should_rebuild &&
-            openmp_hash_table_detail::should_cleanup(occupied, deleted, snapshot->capacity)) {
-            target_capacity = openmp_hash_table_detail::cleanup_capacity(snapshot->capacity, occupied);
-            should_rebuild = true;
-        }
-    }
-
-    if (!should_rebuild) {
-        return;
-    }
-
-    std::unique_lock<std::mutex> resize_lock(resize_mutex_);
-
-    snapshot = state_.load(std::memory_order_acquire);
-    occupied = snapshot->occupied.load(std::memory_order_relaxed);
-    deleted = snapshot->deleted.load(std::memory_order_relaxed);
-    target_capacity = snapshot->capacity;
-    should_rebuild = force_rebuild;
-
-    if (force_rebuild) {
-        target_capacity = std::max(
-            requested_capacity, openmp_hash_table_detail::min_capacity_for_items(occupied));
-    } else {
-        if (requested_capacity > snapshot->capacity) {
-            target_capacity = requested_capacity;
-            should_rebuild = true;
-        }
-        if (!should_rebuild &&
-            openmp_hash_table_detail::should_cleanup(occupied, deleted, snapshot->capacity)) {
-            target_capacity = openmp_hash_table_detail::cleanup_capacity(snapshot->capacity, occupied);
-            should_rebuild = true;
-        }
-    }
-
-    if (!should_rebuild) {
-        return;
-    }
-
-    close_gate_and_wait_for_quiescence();
-    TableState* current = state_.load(std::memory_order_acquire);
-    occupied = current->occupied.load(std::memory_order_relaxed);
-    deleted = current->deleted.load(std::memory_order_relaxed);
-    target_capacity = current->capacity;
-    should_rebuild = force_rebuild;
-
-    if (force_rebuild) {
-        target_capacity = std::max(
-            requested_capacity, openmp_hash_table_detail::min_capacity_for_items(occupied));
-    } else {
-        if (requested_capacity > current->capacity) {
-            target_capacity = requested_capacity;
-            should_rebuild = true;
-        }
-        if (!should_rebuild &&
-            openmp_hash_table_detail::should_cleanup(occupied, deleted, current->capacity)) {
-            target_capacity = openmp_hash_table_detail::cleanup_capacity(current->capacity, occupied);
-            should_rebuild = true;
-        }
-    }
-
-    if (!should_rebuild) {
-        open_gate();
-        return;
-    }
-
-    TableState* replacement = nullptr;
-    try {
-        replacement = new TableState(target_capacity, backend_);
-        rebuild_state(current, replacement);
-        state_.store(replacement, std::memory_order_release);
-    } catch (...) {
-        delete replacement;
-        open_gate();
-        throw;
-    }
-
-    delete current;
-    open_gate();
+size_t ParallelHashTable<K, V, P>::consume_pending_resize_request() {
+    return pending_resize_capacity_.exchange(0, std::memory_order_acq_rel);
 }
 
 template <typename K, typename V, typename P>
 void ParallelHashTable<K, V, P>::clear() {
+    maintenance_mode_.store(true, std::memory_order_release);
+    wait_for_all_operations_to_finish();
+
     std::unique_lock<std::mutex> resize_lock(resize_mutex_);
-    close_gate_and_wait_for_quiescence();
-    reset_state(state_.load(std::memory_order_acquire));
-    open_gate();
+    while (!retired_resize_.empty()) {
+        reclaim_retired_resize_contexts();
+        if (retired_resize_.empty()) {
+            break;
+        }
+        resize_lock.unlock();
+        std::this_thread::yield();
+        resize_lock.lock();
+    }
+
+    ResizeContext* ctx = resize_ctx_.load(std::memory_order_acquire);
+    TableState* current = state_.load(std::memory_order_acquire);
+    const size_t target_capacity = ctx != nullptr ? ctx->target->capacity : current->capacity;
+    TableState* replacement = nullptr;
+    try {
+        replacement = new TableState(target_capacity, backend_);
+    } catch (...) {
+        maintenance_mode_.store(false, std::memory_order_release);
+        throw;
+    }
+
+    ctx = resize_ctx_.exchange(nullptr, std::memory_order_acq_rel);
+    current = state_.exchange(replacement, std::memory_order_acq_rel);
+
+    if (ctx != nullptr) {
+        if (ctx->source != current) {
+            delete ctx->source;
+        }
+        delete ctx->target;
+        delete ctx;
+    }
+    delete current;
+    for (ResizeContext* retired : retired_resize_) {
+        delete retired->source;
+        delete retired;
+    }
+    retired_resize_.clear();
+
+    state_.store(replacement, std::memory_order_release);
+    live_items_.store(0, std::memory_order_release);
+    reset_pending_resize_request();
+    maintenance_mode_.store(false, std::memory_order_release);
 }
 
 template <typename K, typename V, typename P>
@@ -808,8 +833,7 @@ size_t ParallelHashTable<K, V, P>::hash(K key) const {
 
 template <typename K, typename V, typename P>
 size_t ParallelHashTable<K, V, P>::size() const {
-    OperationGuard guard(*this);
-    return guard.state()->occupied.load(std::memory_order_relaxed);
+    return live_items_.load(std::memory_order_acquire);
 }
 
 template <typename K, typename V, typename P>
@@ -821,7 +845,7 @@ size_t ParallelHashTable<K, V, P>::capacity() const {
 template <typename K, typename V, typename P>
 float ParallelHashTable<K, V, P>::load_factor() const {
     OperationGuard guard(*this);
-    return static_cast<float>(guard.state()->occupied.load(std::memory_order_relaxed)) /
+    return static_cast<float>(live_items_.load(std::memory_order_acquire)) /
         static_cast<float>(guard.state()->capacity);
 }
 
@@ -844,33 +868,307 @@ void ParallelHashTable<K, V, P>::rehash(size_t new_capacity) {
 }
 
 template <typename K, typename V, typename P>
-bool ParallelHashTable<K, V, P>::try_claim_slot(TableState* state,
-                                                size_t slot_index,
-                                                K expected_marker,
-                                                K key,
-                                                const V& value) {
-    auto key_ref = std::atomic_ref<K>(state->table[slot_index].key);
-    K expected = expected_marker;
-    if (!key_ref.compare_exchange_strong(
-            expected,
-            openmp_hash_table_detail::busy_key<K>(),
-            std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
+void ParallelHashTable<K, V, P>::reclaim_retired_resize_contexts() {
+    auto it = retired_resize_.begin();
+    while (it != retired_resize_.end()) {
+        ResizeContext* ctx = *it;
+        if (ctx->active_refs.load(std::memory_order_acquire) == 0 &&
+            ctx->source->active_refs.load(std::memory_order_acquire) == 0 &&
+            ctx->source->active_mutators.load(std::memory_order_acquire) == 0) {
+            delete ctx->source;
+            delete ctx;
+            it = retired_resize_.erase(it);
+            continue;
+        }
+        ++it;
+    }
+}
+
+template <typename K, typename V, typename P>
+void ParallelHashTable<K, V, P>::wait_for_write_quiescence(TableState* state) const {
+    while (state->active_mutators.load(std::memory_order_acquire) != 0) {
+        std::this_thread::yield();
+    }
+}
+
+template <typename K, typename V, typename P>
+void ParallelHashTable<K, V, P>::wait_for_all_operations_to_finish() const {
+    for (;;) {
+        TableState* current = state_.load(std::memory_order_acquire);
+        ResizeContext* active = resize_ctx_.load(std::memory_order_acquire);
+        bool idle = true;
+
+        if (current != nullptr &&
+            (current->active_refs.load(std::memory_order_acquire) != 0 ||
+             current->active_mutators.load(std::memory_order_acquire) != 0)) {
+            idle = false;
+        }
+
+        if (active != nullptr &&
+            (active->active_refs.load(std::memory_order_acquire) != 0 ||
+             active->source->active_refs.load(std::memory_order_acquire) != 0 ||
+             active->source->active_mutators.load(std::memory_order_acquire) != 0)) {
+            idle = false;
+        }
+
+        if (idle) {
+            break;
+        }
+        std::this_thread::yield();
+    }
+}
+
+template <typename K, typename V, typename P>
+bool ParallelHashTable<K, V, P>::begin_mutation(TableState* state) const {
+    state->active_mutators.fetch_add(1, std::memory_order_acq_rel);
+    if (state->sealed_for_new_writes.load(std::memory_order_acquire)) {
+        state->active_mutators.fetch_sub(1, std::memory_order_acq_rel);
         return false;
     }
-
-    omp_set_lock(&state->locks[slot_index]);
-    try {
-        state->table[slot_index].value = value;
-        std::atomic_thread_fence(std::memory_order_release);
-        key_ref.store(key, std::memory_order_release);
-    } catch (...) {
-        key_ref.store(expected_marker, std::memory_order_release);
-        omp_unset_lock(&state->locks[slot_index]);
-        throw;
-    }
-    omp_unset_lock(&state->locks[slot_index]);
     return true;
+}
+
+template <typename K, typename V, typename P>
+void ParallelHashTable<K, V, P>::end_mutation(TableState* state) const {
+    state->active_mutators.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+template <typename K, typename V, typename P>
+bool ParallelHashTable<K, V, P>::wait_for_claimed_slot(const TableState* state, size_t slot_index) const {
+    while (load_state(state, slot_index) == openmp_hash_table_detail::SlotState::Claimed) {
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+template <typename K, typename V, typename P>
+openmp_hash_table_detail::SlotState ParallelHashTable<K, V, P>::load_state(const TableState* state,
+                                                                           size_t slot_index) const {
+    return static_cast<openmp_hash_table_detail::SlotState>(
+        state->meta[slot_index].load(std::memory_order_acquire));
+}
+
+template <typename K, typename V, typename P>
+void ParallelHashTable<K, V, P>::store_state(TableState* state,
+                                             size_t slot_index,
+                                             openmp_hash_table_detail::SlotState state_value) const {
+    state->meta[slot_index].store(
+        static_cast<std::uint8_t>(state_value),
+        std::memory_order_release);
+}
+
+template <typename K, typename V, typename P>
+bool ParallelHashTable<K, V, P>::compare_exchange_state(
+    TableState* state,
+    size_t slot_index,
+    openmp_hash_table_detail::SlotState expected,
+    openmp_hash_table_detail::SlotState desired) const {
+    std::uint8_t expected_raw = static_cast<std::uint8_t>(expected);
+    return state->meta[slot_index].compare_exchange_strong(
+        expected_raw,
+        static_cast<std::uint8_t>(desired),
+        std::memory_order_acq_rel,
+        std::memory_order_acquire);
+}
+
+template <typename K, typename V, typename P>
+size_t ParallelHashTable<K, V, P>::resolved_resize_capacity(const TableState* state,
+                                                            size_t requested_capacity,
+                                                            bool force_rebuild) const {
+    const size_t live_items = live_items_.load(std::memory_order_acquire);
+    if (force_rebuild) {
+        return std::max(
+            requested_capacity,
+            openmp_hash_table_detail::min_capacity_for_items(live_items));
+    }
+    if (requested_capacity > state->capacity) {
+        return std::max(
+            requested_capacity,
+            openmp_hash_table_detail::min_capacity_for_items(live_items));
+    }
+
+    const size_t occupied = state->occupied.load(std::memory_order_acquire);
+    const size_t deleted = state->deleted.load(std::memory_order_acquire);
+    if (openmp_hash_table_detail::should_cleanup(occupied, deleted, state->capacity)) {
+        return openmp_hash_table_detail::cleanup_capacity(state->capacity, occupied);
+    }
+    return state->capacity;
+}
+
+template <typename K, typename V, typename P>
+void ParallelHashTable<K, V, P>::publish_resize(TableState* source, TableState* target) {
+    resize_ctx_.store(new ResizeContext(source, target), std::memory_order_release);
+}
+
+template <typename K, typename V, typename P>
+bool ParallelHashTable<K, V, P>::claim_slot_for_migration(TableState* source, size_t slot_index) {
+    if (backend_ == ParallelBackend::CAS) {
+        return compare_exchange_state(
+            source,
+            slot_index,
+            openmp_hash_table_detail::SlotState::Occupied,
+            openmp_hash_table_detail::SlotState::Moving);
+    }
+
+    omp_set_lock(&source->locks[slot_index]);
+    const auto state_value = load_state(source, slot_index);
+    if (state_value != openmp_hash_table_detail::SlotState::Occupied) {
+        omp_unset_lock(&source->locks[slot_index]);
+        return false;
+    }
+    store_state(source, slot_index, openmp_hash_table_detail::SlotState::Moving);
+    omp_unset_lock(&source->locks[slot_index]);
+    return true;
+}
+
+template <typename K, typename V, typename P>
+openmp_hash_table_detail::InsertStatus ParallelHashTable<K, V, P>::insert_migrated_entry(
+    TableState* state,
+    K key,
+    const V& value) {
+    for (;;) {
+        const auto status = insert_into_state(state, key, value);
+        if (status == openmp_hash_table_detail::InsertStatus::Retry) {
+            continue;
+        }
+        if (status == openmp_hash_table_detail::InsertStatus::InsertedNew) {
+            state->occupied.fetch_add(1, std::memory_order_relaxed);
+        } else if (status == openmp_hash_table_detail::InsertStatus::InsertedDeleted) {
+            state->deleted.fetch_sub(1, std::memory_order_relaxed);
+            state->occupied.fetch_add(1, std::memory_order_relaxed);
+        }
+        return status;
+    }
+}
+
+template <typename K, typename V, typename P>
+void ParallelHashTable<K, V, P>::move_slot(ResizeContext* ctx, size_t slot_index) {
+    TableState* source = ctx->source;
+    const auto state_value = load_state(source, slot_index);
+    if (state_value == openmp_hash_table_detail::SlotState::Occupied &&
+        claim_slot_for_migration(source, slot_index)) {
+        const K key = source->table[slot_index].key;
+        const V value = source->table[slot_index].value;
+        const auto status = insert_migrated_entry(ctx->target, key, value);
+        if (status == openmp_hash_table_detail::InsertStatus::Full) {
+            throw std::runtime_error("resize target capacity is too small");
+        }
+        store_state(source, slot_index, openmp_hash_table_detail::SlotState::Moved);
+    }
+
+    ctx->remaining_slots.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+template <typename K, typename V, typename P>
+void ParallelHashTable<K, V, P>::help_resize(ResizeContext* ctx, size_t chunk_size) {
+    TableState* source = ctx->source;
+    const size_t begin = ctx->claim_cursor.fetch_add(chunk_size, std::memory_order_acq_rel);
+    if (begin >= source->capacity) {
+        maybe_finish_resize(ctx);
+        return;
+    }
+
+    const size_t end = std::min(begin + chunk_size, source->capacity);
+    for (size_t slot_index = begin; slot_index < end; ++slot_index) {
+        move_slot(ctx, slot_index);
+    }
+    maybe_finish_resize(ctx);
+}
+
+template <typename K, typename V, typename P>
+void ParallelHashTable<K, V, P>::maybe_finish_resize(ResizeContext* ctx) {
+    if (ctx->remaining_slots.load(std::memory_order_acquire) != 0) {
+        return;
+    }
+
+    size_t pending_target = 0;
+    {
+        std::lock_guard<std::mutex> resize_lock(resize_mutex_);
+        if (resize_ctx_.load(std::memory_order_acquire) != ctx ||
+            ctx->remaining_slots.load(std::memory_order_acquire) != 0) {
+            return;
+        }
+
+        state_.store(ctx->target, std::memory_order_release);
+        resize_ctx_.store(nullptr, std::memory_order_release);
+        retired_resize_.push_back(ctx);
+        reclaim_retired_resize_contexts();
+        pending_target = consume_pending_resize_request();
+    }
+
+    if (pending_target != 0) {
+        maybe_resize(pending_target, false);
+    }
+}
+
+template <typename K, typename V, typename P>
+void ParallelHashTable<K, V, P>::maybe_resize(size_t requested_capacity, bool force_rebuild) {
+    if (maintenance_mode_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    ResizeContext* active = resize_ctx_.load(std::memory_order_acquire);
+    if (active != nullptr) {
+        if (requested_capacity > active->target->capacity) {
+            record_pending_resize_request(requested_capacity);
+        }
+        help_resize(active);
+        return;
+    }
+
+    TableState* current = state_.load(std::memory_order_acquire);
+    const bool should_rebuild = force_rebuild ||
+        requested_capacity > current->capacity ||
+        openmp_hash_table_detail::should_cleanup(
+            current->occupied.load(std::memory_order_acquire),
+            current->deleted.load(std::memory_order_acquire),
+            current->capacity);
+    if (!should_rebuild) {
+        return;
+    }
+
+    ResizeContext* created_ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> resize_lock(resize_mutex_);
+        reclaim_retired_resize_contexts();
+
+        active = resize_ctx_.load(std::memory_order_acquire);
+        if (active != nullptr) {
+            if (requested_capacity > active->target->capacity) {
+                record_pending_resize_request(requested_capacity);
+            }
+        } else {
+            current = state_.load(std::memory_order_acquire);
+            const bool refreshed_should_rebuild = force_rebuild ||
+                requested_capacity > current->capacity ||
+                openmp_hash_table_detail::should_cleanup(
+                    current->occupied.load(std::memory_order_acquire),
+                    current->deleted.load(std::memory_order_acquire),
+                    current->capacity);
+            if (!refreshed_should_rebuild) {
+                return;
+            }
+
+            const size_t target_capacity =
+                resolved_resize_capacity(current, requested_capacity, force_rebuild);
+            current->sealed_for_new_writes.store(true, std::memory_order_release);
+            wait_for_write_quiescence(current);
+
+            TableState* replacement = nullptr;
+            try {
+                replacement = new TableState(target_capacity, backend_);
+                publish_resize(current, replacement);
+            } catch (...) {
+                delete replacement;
+                current->sealed_for_new_writes.store(false, std::memory_order_release);
+                throw;
+            }
+            created_ctx = resize_ctx_.load(std::memory_order_acquire);
+            reset_pending_resize_request(target_capacity);
+        }
+    }
+
+    help_resize(created_ctx != nullptr ? created_ctx : active);
 }
 
 template <typename K, typename V, typename P>
@@ -878,47 +1176,71 @@ openmp_hash_table_detail::InsertStatus ParallelHashTable<K, V, P>::insert_with_c
     TableState* state,
     K key,
     const V& value) {
-    const K empty_key = openmp_hash_table_detail::empty_key<K>();
-    const K deleted_key = openmp_hash_table_detail::deleted_key<K>();
-    const K busy_key = openmp_hash_table_detail::busy_key<K>();
     const size_t start = openmp_hash_table_detail::hash_key(key, state->capacity);
     size_t first_deleted = state->capacity;
 
     for (int attempt = 0; static_cast<size_t>(attempt) < state->capacity; ++attempt) {
         const size_t slot_index = next_slot(start, attempt, state->capacity);
-        auto key_ref = std::atomic_ref<K>(state->table[slot_index].key);
-        K current = key_ref.load(std::memory_order_acquire);
-
-        while (current == busy_key) {
-            current = key_ref.load(std::memory_order_acquire);
+        const auto state_value = load_state(state, slot_index);
+        if (state_value == openmp_hash_table_detail::SlotState::Claimed) {
+            wait_for_claimed_slot(state, slot_index);
+            --attempt;
+            continue;
         }
-
-        if (current == key) {
+        if (openmp_hash_table_detail::is_readable_state(state_value) &&
+            state->table[slot_index].key == key) {
             return openmp_hash_table_detail::InsertStatus::Duplicate;
         }
-        if (current == deleted_key) {
+        if (state_value == openmp_hash_table_detail::SlotState::Deleted) {
             if (first_deleted == state->capacity) {
                 first_deleted = slot_index;
             }
             continue;
         }
-        if (current == empty_key) {
-            if (first_deleted != state->capacity) {
-                return try_claim_slot(state, first_deleted, deleted_key, key, value)
-                    ? openmp_hash_table_detail::InsertStatus::InsertedDeleted
-                    : openmp_hash_table_detail::InsertStatus::Retry;
+        if (state_value == openmp_hash_table_detail::SlotState::Empty) {
+            const size_t target_slot = first_deleted != state->capacity ? first_deleted : slot_index;
+            const auto expected_state = first_deleted != state->capacity
+                ? openmp_hash_table_detail::SlotState::Deleted
+                : openmp_hash_table_detail::SlotState::Empty;
+            if (!compare_exchange_state(
+                    state,
+                    target_slot,
+                    expected_state,
+                    openmp_hash_table_detail::SlotState::Claimed)) {
+                return openmp_hash_table_detail::InsertStatus::Retry;
             }
 
-            return try_claim_slot(state, slot_index, empty_key, key, value)
+            try {
+                state->table[target_slot].key = key;
+                state->table[target_slot].value = value;
+            } catch (...) {
+                store_state(state, target_slot, expected_state);
+                throw;
+            }
+            store_state(state, target_slot, openmp_hash_table_detail::SlotState::Occupied);
+            return expected_state == openmp_hash_table_detail::SlotState::Empty
                 ? openmp_hash_table_detail::InsertStatus::InsertedNew
-                : openmp_hash_table_detail::InsertStatus::Retry;
+                : openmp_hash_table_detail::InsertStatus::InsertedDeleted;
         }
     }
 
     if (first_deleted != state->capacity) {
-        return try_claim_slot(state, first_deleted, deleted_key, key, value)
-            ? openmp_hash_table_detail::InsertStatus::InsertedDeleted
-            : openmp_hash_table_detail::InsertStatus::Retry;
+        if (!compare_exchange_state(
+                state,
+                first_deleted,
+                openmp_hash_table_detail::SlotState::Deleted,
+                openmp_hash_table_detail::SlotState::Claimed)) {
+            return openmp_hash_table_detail::InsertStatus::Retry;
+        }
+        try {
+            state->table[first_deleted].key = key;
+            state->table[first_deleted].value = value;
+        } catch (...) {
+            store_state(state, first_deleted, openmp_hash_table_detail::SlotState::Deleted);
+            throw;
+        }
+        store_state(state, first_deleted, openmp_hash_table_detail::SlotState::Occupied);
+        return openmp_hash_table_detail::InsertStatus::InsertedDeleted;
     }
 
     return openmp_hash_table_detail::InsertStatus::Full;
@@ -929,65 +1251,87 @@ openmp_hash_table_detail::InsertStatus ParallelHashTable<K, V, P>::insert_with_m
     TableState* state,
     K key,
     const V& value) {
-    const K empty_key = openmp_hash_table_detail::empty_key<K>();
-    const K deleted_key = openmp_hash_table_detail::deleted_key<K>();
     const size_t start = openmp_hash_table_detail::hash_key(key, state->capacity);
     size_t first_deleted = state->capacity;
 
     for (int attempt = 0; static_cast<size_t>(attempt) < state->capacity; ++attempt) {
         const size_t slot_index = next_slot(start, attempt, state->capacity);
-        omp_set_lock(&state->locks[slot_index]);
-        const K current = state->table[slot_index].key;
+        const auto state_value = load_state(state, slot_index);
+        if (state_value == openmp_hash_table_detail::SlotState::Claimed) {
+            wait_for_claimed_slot(state, slot_index);
+            --attempt;
+            continue;
+        }
 
-        if (current == key) {
+        omp_set_lock(&state->locks[slot_index]);
+        const auto locked_state = load_state(state, slot_index);
+        if (openmp_hash_table_detail::is_readable_state(locked_state) &&
+            state->table[slot_index].key == key) {
             omp_unset_lock(&state->locks[slot_index]);
             return openmp_hash_table_detail::InsertStatus::Duplicate;
         }
-        if (current == deleted_key) {
+        if (locked_state == openmp_hash_table_detail::SlotState::Deleted) {
             if (first_deleted == state->capacity) {
                 first_deleted = slot_index;
             }
             omp_unset_lock(&state->locks[slot_index]);
             continue;
         }
-        if (current == empty_key) {
+        if (locked_state == openmp_hash_table_detail::SlotState::Empty) {
             if (first_deleted == state->capacity) {
-                state->table[slot_index].key = key;
-                state->table[slot_index].value = value;
+                try {
+                    state->table[slot_index].key = key;
+                    state->table[slot_index].value = value;
+                } catch (...) {
+                    omp_unset_lock(&state->locks[slot_index]);
+                    throw;
+                }
+                store_state(state, slot_index, openmp_hash_table_detail::SlotState::Occupied);
                 omp_unset_lock(&state->locks[slot_index]);
                 return openmp_hash_table_detail::InsertStatus::InsertedNew;
             }
 
             omp_unset_lock(&state->locks[slot_index]);
             omp_set_lock(&state->locks[first_deleted]);
-            const K target_key = state->table[first_deleted].key;
-            if (target_key == deleted_key) {
-                state->table[first_deleted].key = key;
-                state->table[first_deleted].value = value;
+            if (load_state(state, first_deleted) == openmp_hash_table_detail::SlotState::Deleted) {
+                try {
+                    state->table[first_deleted].key = key;
+                    state->table[first_deleted].value = value;
+                } catch (...) {
+                    omp_unset_lock(&state->locks[first_deleted]);
+                    throw;
+                }
+                store_state(state, first_deleted, openmp_hash_table_detail::SlotState::Occupied);
                 omp_unset_lock(&state->locks[first_deleted]);
                 return openmp_hash_table_detail::InsertStatus::InsertedDeleted;
             }
-            if (target_key == key) {
+            if (openmp_hash_table_detail::is_readable_state(load_state(state, first_deleted)) &&
+                state->table[first_deleted].key == key) {
                 omp_unset_lock(&state->locks[first_deleted]);
                 return openmp_hash_table_detail::InsertStatus::Duplicate;
             }
             omp_unset_lock(&state->locks[first_deleted]);
             return openmp_hash_table_detail::InsertStatus::Retry;
         }
-
         omp_unset_lock(&state->locks[slot_index]);
     }
 
     if (first_deleted != state->capacity) {
         omp_set_lock(&state->locks[first_deleted]);
-        const K target_key = state->table[first_deleted].key;
-        if (target_key == deleted_key) {
-            state->table[first_deleted].key = key;
-            state->table[first_deleted].value = value;
+        if (load_state(state, first_deleted) == openmp_hash_table_detail::SlotState::Deleted) {
+            try {
+                state->table[first_deleted].key = key;
+                state->table[first_deleted].value = value;
+            } catch (...) {
+                omp_unset_lock(&state->locks[first_deleted]);
+                throw;
+            }
+            store_state(state, first_deleted, openmp_hash_table_detail::SlotState::Occupied);
             omp_unset_lock(&state->locks[first_deleted]);
             return openmp_hash_table_detail::InsertStatus::InsertedDeleted;
         }
-        if (target_key == key) {
+        if (openmp_hash_table_detail::is_readable_state(load_state(state, first_deleted)) &&
+            state->table[first_deleted].key == key) {
             omp_unset_lock(&state->locks[first_deleted]);
             return openmp_hash_table_detail::InsertStatus::Duplicate;
         }
@@ -1015,91 +1359,147 @@ bool ParallelHashTable<K, V, P>::insert(K key, V value) {
     for (;;) {
         size_t resize_target = 0;
         bool inserted = false;
+        bool duplicate = false;
+        bool retry = false;
 
         {
             OperationGuard guard(*this);
-            TableState* state = guard.state();
-
-            for (;;) {
-                const auto status = insert_into_state(state, key, value);
-                if (status == openmp_hash_table_detail::InsertStatus::Retry) {
-                    continue;
-                }
-                if (status == openmp_hash_table_detail::InsertStatus::Duplicate) {
-                    return true;
-                }
-                if (status == openmp_hash_table_detail::InsertStatus::InsertedNew) {
-                    const size_t occupied =
-                        state->occupied.fetch_add(1, std::memory_order_relaxed) + 1;
-                    inserted = true;
-                    if (openmp_hash_table_detail::should_grow(occupied, state->capacity)) {
-                        resize_target =
-                            openmp_hash_table_detail::growth_capacity(state->capacity, occupied);
+            if (guard.resize() == nullptr) {
+                TableState* state = guard.state();
+                if (!begin_mutation(state)) {
+                    retry = true;
+                } else {
+                    try {
+                        for (;;) {
+                            const auto status = insert_into_state(state, key, value);
+                            if (status == openmp_hash_table_detail::InsertStatus::Retry) {
+                                continue;
+                            }
+                            if (status == openmp_hash_table_detail::InsertStatus::Duplicate) {
+                                duplicate = true;
+                            } else if (status == openmp_hash_table_detail::InsertStatus::InsertedNew) {
+                                const size_t occupied =
+                                    state->occupied.fetch_add(1, std::memory_order_relaxed) + 1;
+                                live_items_.fetch_add(1, std::memory_order_relaxed);
+                                inserted = true;
+                                if (openmp_hash_table_detail::should_grow(occupied, state->capacity)) {
+                                    resize_target = openmp_hash_table_detail::growth_capacity(
+                                        state->capacity,
+                                        occupied);
+                                }
+                            } else if (status == openmp_hash_table_detail::InsertStatus::InsertedDeleted) {
+                                state->deleted.fetch_sub(1, std::memory_order_relaxed);
+                                const size_t occupied =
+                                    state->occupied.fetch_add(1, std::memory_order_relaxed) + 1;
+                                live_items_.fetch_add(1, std::memory_order_relaxed);
+                                inserted = true;
+                                if (openmp_hash_table_detail::should_grow(occupied, state->capacity)) {
+                                    resize_target = openmp_hash_table_detail::growth_capacity(
+                                        state->capacity,
+                                        occupied);
+                                }
+                            } else {
+                                resize_target = openmp_hash_table_detail::growth_capacity(
+                                    state->capacity,
+                                    state->occupied.load(std::memory_order_acquire) + 1);
+                            }
+                            break;
+                        }
+                    } catch (...) {
+                        end_mutation(state);
+                        throw;
                     }
-                    break;
+                    end_mutation(state);
                 }
-                if (status == openmp_hash_table_detail::InsertStatus::InsertedDeleted) {
-                    state->deleted.fetch_sub(1, std::memory_order_relaxed);
-                    const size_t occupied =
-                        state->occupied.fetch_add(1, std::memory_order_relaxed) + 1;
-                    inserted = true;
-                    if (openmp_hash_table_detail::should_grow(occupied, state->capacity)) {
-                        resize_target =
-                            openmp_hash_table_detail::growth_capacity(state->capacity, occupied);
+            } else {
+                ResizeContext* ctx = guard.resize();
+                TableState* target = ctx->target;
+                TableState* source = ctx->source;
+                if (contains_in_state(target, key, false) ||
+                    contains_in_state(source, key, false)) {
+                    duplicate = true;
+                } else if (contains_in_state(source, key, true)) {
+                    help_resize(ctx);
+                    retry = true;
+                } else {
+                    for (;;) {
+                        const auto status = insert_into_state(target, key, value);
+                        if (status == openmp_hash_table_detail::InsertStatus::Retry) {
+                            continue;
+                        }
+                        if (status == openmp_hash_table_detail::InsertStatus::Duplicate) {
+                            duplicate = true;
+                        } else if (status == openmp_hash_table_detail::InsertStatus::InsertedNew) {
+                            const size_t occupied =
+                                target->occupied.fetch_add(1, std::memory_order_relaxed) + 1;
+                            live_items_.fetch_add(1, std::memory_order_relaxed);
+                            inserted = true;
+                            if (openmp_hash_table_detail::should_grow(occupied, target->capacity)) {
+                                resize_target = openmp_hash_table_detail::growth_capacity(
+                                    target->capacity,
+                                    occupied);
+                            }
+                        } else if (status == openmp_hash_table_detail::InsertStatus::InsertedDeleted) {
+                            target->deleted.fetch_sub(1, std::memory_order_relaxed);
+                            const size_t occupied =
+                                target->occupied.fetch_add(1, std::memory_order_relaxed) + 1;
+                            live_items_.fetch_add(1, std::memory_order_relaxed);
+                            inserted = true;
+                            if (openmp_hash_table_detail::should_grow(occupied, target->capacity)) {
+                                resize_target = openmp_hash_table_detail::growth_capacity(
+                                    target->capacity,
+                                    occupied);
+                            }
+                        } else {
+                            resize_target = openmp_hash_table_detail::growth_capacity(
+                                target->capacity,
+                                target->occupied.load(std::memory_order_acquire) + 1);
+                            record_pending_resize_request(resize_target);
+                        }
+                        break;
                     }
-                    break;
                 }
-
-                resize_target =
-                    openmp_hash_table_detail::growth_capacity(state->capacity, state->occupied.load() + 1);
-                break;
+                help_resize(ctx);
             }
         }
 
-        if (inserted) {
-            if (resize_target != 0) {
-                maybe_resize(resize_target, false);
-            }
+        if (retry) {
+            continue;
+        }
+        if (resize_target != 0) {
+            maybe_resize(resize_target, false);
+        }
+        if (duplicate || inserted) {
             return true;
         }
-
-        maybe_resize(resize_target, false);
     }
 }
 
 template <typename K, typename V, typename P>
-bool ParallelHashTable<K, V, P>::get_with_cas(TableState* state, K key, V& out_value) const {
-    const K empty_key = openmp_hash_table_detail::empty_key<K>();
-    const K busy_key = openmp_hash_table_detail::busy_key<K>();
+bool ParallelHashTable<K, V, P>::get_with_cas(TableState* state,
+                                              K key,
+                                              V& out_value,
+                                              bool include_moved_states) const {
     const size_t start = openmp_hash_table_detail::hash_key(key, state->capacity);
 
     for (int attempt = 0; static_cast<size_t>(attempt) < state->capacity; ++attempt) {
         const size_t slot_index = next_slot(start, attempt, state->capacity);
-        auto key_ref = std::atomic_ref<K>(state->table[slot_index].key);
-        K current = key_ref.load(std::memory_order_acquire);
-
-        while (current == busy_key) {
-            current = key_ref.load(std::memory_order_acquire);
+        const auto state_value = load_state(state, slot_index);
+        if (state_value == openmp_hash_table_detail::SlotState::Claimed) {
+            wait_for_claimed_slot(state, slot_index);
+            --attempt;
+            continue;
         }
-
-        if (current == empty_key) {
+        if (openmp_hash_table_detail::is_probe_terminal_state(state_value)) {
             return false;
         }
-        if (current == key) {
-            omp_set_lock(&state->locks[slot_index]);
-            const K confirmed = key_ref.load(std::memory_order_acquire);
-            if (confirmed == key) {
-                out_value = state->table[slot_index].value;
-                omp_unset_lock(&state->locks[slot_index]);
-                return true;
-            }
-            omp_unset_lock(&state->locks[slot_index]);
-            if (confirmed == empty_key) {
-                return false;
-            }
-            if (confirmed == busy_key) {
-                --attempt;
-            }
+        const bool readable = state_value == openmp_hash_table_detail::SlotState::Occupied ||
+            (include_moved_states &&
+             (state_value == openmp_hash_table_detail::SlotState::Moving ||
+              state_value == openmp_hash_table_detail::SlotState::Moved));
+        if (readable && state->table[slot_index].key == key) {
+            out_value = state->table[slot_index].value;
+            return true;
         }
     }
 
@@ -1107,25 +1507,36 @@ bool ParallelHashTable<K, V, P>::get_with_cas(TableState* state, K key, V& out_v
 }
 
 template <typename K, typename V, typename P>
-bool ParallelHashTable<K, V, P>::get_with_mutex(TableState* state, K key, V& out_value) const {
-    const K empty_key = openmp_hash_table_detail::empty_key<K>();
+bool ParallelHashTable<K, V, P>::get_with_mutex(TableState* state,
+                                                K key,
+                                                V& out_value,
+                                                bool include_moved_states) const {
     const size_t start = openmp_hash_table_detail::hash_key(key, state->capacity);
 
     for (int attempt = 0; static_cast<size_t>(attempt) < state->capacity; ++attempt) {
         const size_t slot_index = next_slot(start, attempt, state->capacity);
-        omp_set_lock(&state->locks[slot_index]);
-        const K current = state->table[slot_index].key;
+        const auto state_value = load_state(state, slot_index);
+        if (state_value == openmp_hash_table_detail::SlotState::Claimed) {
+            wait_for_claimed_slot(state, slot_index);
+            --attempt;
+            continue;
+        }
 
-        if (current == empty_key) {
+        omp_set_lock(&state->locks[slot_index]);
+        const auto locked_state = load_state(state, slot_index);
+        if (openmp_hash_table_detail::is_probe_terminal_state(locked_state)) {
             omp_unset_lock(&state->locks[slot_index]);
             return false;
         }
-        if (current == key) {
+        const bool readable = locked_state == openmp_hash_table_detail::SlotState::Occupied ||
+            (include_moved_states &&
+             (locked_state == openmp_hash_table_detail::SlotState::Moving ||
+              locked_state == openmp_hash_table_detail::SlotState::Moved));
+        if (readable && state->table[slot_index].key == key) {
             out_value = state->table[slot_index].value;
             omp_unset_lock(&state->locks[slot_index]);
             return true;
         }
-
         omp_unset_lock(&state->locks[slot_index]);
     }
 
@@ -1133,46 +1544,112 @@ bool ParallelHashTable<K, V, P>::get_with_mutex(TableState* state, K key, V& out
 }
 
 template <typename K, typename V, typename P>
-bool ParallelHashTable<K, V, P>::get_from_state(TableState* state, K key, V& out_value) const {
+bool ParallelHashTable<K, V, P>::get_from_state(TableState* state,
+                                                K key,
+                                                V& out_value,
+                                                bool include_moved_states) const {
     return backend_ == ParallelBackend::CAS
-        ? get_with_cas(state, key, out_value)
-        : get_with_mutex(state, key, out_value);
+        ? get_with_cas(state, key, out_value, include_moved_states)
+        : get_with_mutex(state, key, out_value, include_moved_states);
+}
+
+template <typename K, typename V, typename P>
+bool ParallelHashTable<K, V, P>::contains_in_state(TableState* state,
+                                                   K key,
+                                                   bool include_moved_states) const {
+    const size_t start = openmp_hash_table_detail::hash_key(key, state->capacity);
+    for (int attempt = 0; static_cast<size_t>(attempt) < state->capacity; ++attempt) {
+        const size_t slot_index = next_slot(start, attempt, state->capacity);
+        const auto state_value = load_state(state, slot_index);
+        if (state_value == openmp_hash_table_detail::SlotState::Claimed) {
+            wait_for_claimed_slot(state, slot_index);
+            --attempt;
+            continue;
+        }
+        if (openmp_hash_table_detail::is_probe_terminal_state(state_value)) {
+            return false;
+        }
+        const bool readable = state_value == openmp_hash_table_detail::SlotState::Occupied ||
+            (include_moved_states &&
+             (state_value == openmp_hash_table_detail::SlotState::Moving ||
+              state_value == openmp_hash_table_detail::SlotState::Moved));
+        if (readable && state->table[slot_index].key == key) {
+            return true;
+        }
+    }
+    return false;
 }
 
 template <typename K, typename V, typename P>
 bool ParallelHashTable<K, V, P>::get(K key, V& out_value) {
-    OperationGuard guard(*this);
-    return get_from_state(guard.state(), key, out_value);
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        OperationGuard guard(*this);
+        if (guard.resize() == nullptr) {
+            return get_from_state(guard.state(), key, out_value, false);
+        }
+
+        ResizeContext* ctx = guard.resize();
+        if (get_from_state(ctx->target, key, out_value, false)) {
+            help_resize(ctx);
+            return true;
+        }
+        if (get_from_state(ctx->source, key, out_value, false)) {
+            help_resize(ctx);
+            return true;
+        }
+        if (!contains_in_state(ctx->source, key, true)) {
+            help_resize(ctx);
+            return false;
+        }
+        help_resize(ctx);
+    }
+
+    return false;
 }
 
 template <typename K, typename V, typename P>
-bool ParallelHashTable<K, V, P>::remove_with_cas(TableState* state, K key) {
-    const K empty_key = openmp_hash_table_detail::empty_key<K>();
-    const K deleted_key = openmp_hash_table_detail::deleted_key<K>();
-    const K busy_key = openmp_hash_table_detail::busy_key<K>();
+bool ParallelHashTable<K, V, P>::remove_with_cas(TableState* state,
+                                                 K key,
+                                                 bool allow_moved_redirect) {
     const size_t start = openmp_hash_table_detail::hash_key(key, state->capacity);
 
     for (int attempt = 0; static_cast<size_t>(attempt) < state->capacity; ++attempt) {
         const size_t slot_index = next_slot(start, attempt, state->capacity);
-        auto key_ref = std::atomic_ref<K>(state->table[slot_index].key);
-        K current = key_ref.load(std::memory_order_acquire);
-
-        while (current == busy_key) {
-            current = key_ref.load(std::memory_order_acquire);
+        const auto state_value = load_state(state, slot_index);
+        if (state_value == openmp_hash_table_detail::SlotState::Claimed) {
+            wait_for_claimed_slot(state, slot_index);
+            --attempt;
+            continue;
         }
-
-        if (current == empty_key) {
+        if (openmp_hash_table_detail::is_probe_terminal_state(state_value)) {
             return false;
         }
-        if (current == key) {
-            K expected = key;
-            if (key_ref.compare_exchange_strong(
-                    expected,
-                    deleted_key,
-                    std::memory_order_acq_rel,
-                    std::memory_order_acquire)) {
+        if (state->table[slot_index].key != key) {
+            continue;
+        }
+        if (state_value == openmp_hash_table_detail::SlotState::Occupied) {
+            if (compare_exchange_state(
+                    state,
+                    slot_index,
+                    openmp_hash_table_detail::SlotState::Occupied,
+                    openmp_hash_table_detail::SlotState::Deleted)) {
                 return true;
             }
+            const auto actual = load_state(state, slot_index);
+            if (allow_moved_redirect &&
+                (actual == openmp_hash_table_detail::SlotState::Moving ||
+                 actual == openmp_hash_table_detail::SlotState::Moved)) {
+                return false;
+            }
+            if (actual == openmp_hash_table_detail::SlotState::Deleted) {
+                return false;
+            }
+            --attempt;
+            continue;
+        }
+        if (allow_moved_redirect &&
+            (state_value == openmp_hash_table_detail::SlotState::Moving ||
+             state_value == openmp_hash_table_detail::SlotState::Moved)) {
             return false;
         }
     }
@@ -1181,25 +1658,34 @@ bool ParallelHashTable<K, V, P>::remove_with_cas(TableState* state, K key) {
 }
 
 template <typename K, typename V, typename P>
-bool ParallelHashTable<K, V, P>::remove_with_mutex(TableState* state, K key) {
-    const K empty_key = openmp_hash_table_detail::empty_key<K>();
+bool ParallelHashTable<K, V, P>::remove_with_mutex(TableState* state,
+                                                   K key,
+                                                   bool allow_moved_redirect) {
     const size_t start = openmp_hash_table_detail::hash_key(key, state->capacity);
 
     for (int attempt = 0; static_cast<size_t>(attempt) < state->capacity; ++attempt) {
         const size_t slot_index = next_slot(start, attempt, state->capacity);
         omp_set_lock(&state->locks[slot_index]);
-        const K current = state->table[slot_index].key;
-
-        if (current == empty_key) {
+        const auto state_value = load_state(state, slot_index);
+        if (openmp_hash_table_detail::is_probe_terminal_state(state_value)) {
             omp_unset_lock(&state->locks[slot_index]);
             return false;
         }
-        if (current == key) {
-            openmp_hash_table_detail::mark_deleted_slot<Slot, K, V>(state->table[slot_index]);
+        if (state->table[slot_index].key != key) {
+            omp_unset_lock(&state->locks[slot_index]);
+            continue;
+        }
+        if (state_value == openmp_hash_table_detail::SlotState::Occupied) {
+            store_state(state, slot_index, openmp_hash_table_detail::SlotState::Deleted);
             omp_unset_lock(&state->locks[slot_index]);
             return true;
         }
-
+        if (allow_moved_redirect &&
+            (state_value == openmp_hash_table_detail::SlotState::Moving ||
+             state_value == openmp_hash_table_detail::SlotState::Moved)) {
+            omp_unset_lock(&state->locks[slot_index]);
+            return false;
+        }
         omp_unset_lock(&state->locks[slot_index]);
     }
 
@@ -1207,38 +1693,107 @@ bool ParallelHashTable<K, V, P>::remove_with_mutex(TableState* state, K key) {
 }
 
 template <typename K, typename V, typename P>
-bool ParallelHashTable<K, V, P>::remove_from_state(TableState* state, K key) {
+bool ParallelHashTable<K, V, P>::remove_from_state(TableState* state,
+                                                   K key,
+                                                   bool allow_moved_redirect) {
     return backend_ == ParallelBackend::CAS
-        ? remove_with_cas(state, key)
-        : remove_with_mutex(state, key);
+        ? remove_with_cas(state, key, allow_moved_redirect)
+        : remove_with_mutex(state, key, allow_moved_redirect);
 }
 
 template <typename K, typename V, typename P>
 bool ParallelHashTable<K, V, P>::remove(K key) {
-    size_t cleanup_target = 0;
-    bool removed = false;
+    int resize_redirect_retries = 0;
+    for (;;) {
+        size_t cleanup_target = 0;
+        bool removed = false;
+        bool retry = false;
+        bool resize_retry = false;
 
-    {
-        OperationGuard guard(*this);
-        TableState* state = guard.state();
-        removed = remove_from_state(state, key);
-        if (removed) {
-            const size_t occupied =
-                state->occupied.fetch_sub(1, std::memory_order_relaxed) - 1;
-            const size_t deleted =
-                state->deleted.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (openmp_hash_table_detail::should_cleanup(occupied, deleted, state->capacity)) {
-                cleanup_target =
-                    openmp_hash_table_detail::cleanup_capacity(state->capacity, occupied);
+        {
+            OperationGuard guard(*this);
+            if (guard.resize() == nullptr) {
+                TableState* state = guard.state();
+                if (!begin_mutation(state)) {
+                    retry = true;
+                } else {
+                    removed = remove_from_state(state, key, false);
+                    if (removed) {
+                        live_items_.fetch_sub(1, std::memory_order_relaxed);
+                        const size_t occupied =
+                            state->occupied.fetch_sub(1, std::memory_order_relaxed) - 1;
+                        const size_t deleted =
+                            state->deleted.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (openmp_hash_table_detail::should_cleanup(occupied, deleted, state->capacity)) {
+                            cleanup_target =
+                                openmp_hash_table_detail::cleanup_capacity(state->capacity, occupied);
+                        }
+                    }
+                    end_mutation(state);
+                }
+            } else {
+                ResizeContext* ctx = guard.resize();
+                TableState* target = ctx->target;
+                TableState* source = ctx->source;
+
+                removed = remove_from_state(target, key, false);
+                if (removed) {
+                    live_items_.fetch_sub(1, std::memory_order_relaxed);
+                    const size_t occupied =
+                        target->occupied.fetch_sub(1, std::memory_order_relaxed) - 1;
+                    const size_t deleted =
+                        target->deleted.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (openmp_hash_table_detail::should_cleanup(occupied, deleted, target->capacity)) {
+                        cleanup_target =
+                            openmp_hash_table_detail::cleanup_capacity(target->capacity, occupied);
+                    }
+                } else {
+                    removed = remove_from_state(source, key, true);
+                    if (removed) {
+                        live_items_.fetch_sub(1, std::memory_order_relaxed);
+                    } else {
+                        const bool source_redirect_hint =
+                            !contains_in_state(source, key, false) &&
+                            contains_in_state(source, key, true);
+                        help_resize(ctx);
+                        removed = remove_from_state(target, key, false);
+                        resize_retry = !removed && source_redirect_hint;
+                        retry = resize_retry;
+                        if (removed) {
+                            live_items_.fetch_sub(1, std::memory_order_relaxed);
+                            const size_t occupied =
+                                target->occupied.fetch_sub(1, std::memory_order_relaxed) - 1;
+                            const size_t deleted =
+                                target->deleted.fetch_add(1, std::memory_order_relaxed) + 1;
+                            if (openmp_hash_table_detail::should_cleanup(
+                                    occupied,
+                                    deleted,
+                                    target->capacity)) {
+                                cleanup_target =
+                                    openmp_hash_table_detail::cleanup_capacity(target->capacity, occupied);
+                            }
+                        }
+                    }
+                }
+                help_resize(ctx);
             }
         }
-    }
 
-    if (cleanup_target != 0) {
-        maybe_resize(cleanup_target, false);
+        if (retry) {
+            if (resize_retry) {
+                ++resize_redirect_retries;
+                if (resize_redirect_retries >= 4) {
+                    return false;
+                }
+            }
+            continue;
+        }
+        resize_redirect_retries = 0;
+        if (cleanup_target != 0) {
+            maybe_resize(cleanup_target, false);
+        }
+        return removed;
     }
-
-    return removed;
 }
 
 template <typename K, typename V, typename P>

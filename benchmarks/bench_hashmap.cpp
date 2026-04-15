@@ -20,6 +20,9 @@ constexpr int KEYS_SEQUENTIAL = 0;
 constexpr int KEYS_RANDOM = 1;
 constexpr int KEYS_ZIPF = 2;
 
+constexpr int WORKLOAD_STEADY = 0;
+constexpr int WORKLOAD_RESIZE = 1;
+
 constexpr int MAX_REPS = 20;
 
 double mean(const std::array<double, MAX_REPS>& values, int count) {
@@ -119,6 +122,17 @@ const char* dist_name(int key_dist) {
             return "Random";
         case KEYS_ZIPF:
             return "Zipf (skewed)";
+        default:
+            return "Unknown";
+    }
+}
+
+const char* workload_name(int workload) {
+    switch (workload) {
+        case WORKLOAD_STEADY:
+            return "Steady";
+        case WORKLOAD_RESIZE:
+            return "Resize-heavy";
         default:
             return "Unknown";
     }
@@ -278,9 +292,9 @@ int benchmark_table(Table& table,
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    if (argc != 8) {
+    if (argc != 8 && argc != 9) {
         std::fprintf(stderr,
-                     "usage: bench_hashmap table_size num_ops who threads probing key_dist reps\n");
+                     "usage: bench_hashmap table_size num_ops who threads probing key_dist reps [workload]\n");
         std::fprintf(stderr,
                      "  table_size : slots in hash table (e.g. 1000000, 10000000)\n");
         std::fprintf(stderr, "  num_ops    : keys to insert/search\n");
@@ -289,6 +303,7 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr, "  probing    : 0=linear, 1=quadratic\n");
         std::fprintf(stderr, "  key_dist   : 0=sequential, 1=random, 2=zipf\n");
         std::fprintf(stderr, "  reps       : repetitions (recommended: 7)\n");
+        std::fprintf(stderr, "  workload   : optional, 0=steady (default), 1=resize-heavy\n");
         return 1;
     }
 
@@ -299,6 +314,7 @@ int main(int argc, char* argv[]) {
     const int probing = std::atoi(argv[5]);
     const int key_dist = std::atoi(argv[6]);
     const int reps = std::atoi(argv[7]);
+    const int workload = argc == 9 ? std::atoi(argv[8]) : WORKLOAD_STEADY;
 
     if (reps < 1 || reps > MAX_REPS) {
         std::fprintf(stderr, "reps must be between 1 and %d\n", MAX_REPS);
@@ -310,6 +326,10 @@ int main(int argc, char* argv[]) {
     }
     if (probing != PROBE_LINEAR && probing != PROBE_QUADRATIC) {
         std::fprintf(stderr, "probing must be 0 or 1\n");
+        return 1;
+    }
+    if (workload != WORKLOAD_STEADY && workload != WORKLOAD_RESIZE) {
+        std::fprintf(stderr, "workload must be 0 or 1\n");
         return 1;
     }
     if (num_ops >= table_size) {
@@ -328,6 +348,7 @@ int main(int argc, char* argv[]) {
     std::printf("Threads     : %d\n", num_threads);
     std::printf("Probing     : %s\n", probe_name(probing));
     std::printf("Key dist    : %s\n", dist_name(key_dist));
+    std::printf("Workload    : %s\n", workload_name(workload));
     std::printf("Repetitions : %d (drops min+max, averages rest)\n", reps);
     std::printf("========================================\n");
 
@@ -339,10 +360,13 @@ int main(int argc, char* argv[]) {
     int last_found_count = 0;
     int mismatches = 0;
     const bool use_quadratic = probing == PROBE_QUADRATIC;
+    const int initial_table_size = workload == WORKLOAD_RESIZE
+        ? std::max(8, table_size / 16)
+        : table_size;
 
     if (which_code == IMPL_SEQUENTIAL) {
         if (use_quadratic) {
-            SequentialHashTable<int, int, ProbingStrategy::QUADRATIC> table(table_size);
+            SequentialHashTable<int, int, ProbingStrategy::QUADRATIC> table(initial_table_size);
             last_found_count = benchmark_table(
                 table,
                 keys,
@@ -353,7 +377,7 @@ int main(int argc, char* argv[]) {
                 },
                 times);
         } else {
-            SequentialHashTable<int, int, ProbingStrategy::LINEAR> table(table_size);
+            SequentialHashTable<int, int, ProbingStrategy::LINEAR> table(initial_table_size);
             last_found_count = benchmark_table(
                 table,
                 keys,
@@ -369,7 +393,7 @@ int main(int argc, char* argv[]) {
 
         if (use_quadratic) {
             ParallelHashTable<int, int, ProbingStrategy::QUADRATIC> table(
-                table_size, num_threads, backend);
+                initial_table_size, num_threads, backend);
             last_found_count = benchmark_table(
                 table,
                 keys,
@@ -382,7 +406,7 @@ int main(int argc, char* argv[]) {
             mismatches = count_mismatches(table, keys);
         } else {
             ParallelHashTable<int, int, ProbingStrategy::LINEAR> table(
-                table_size, num_threads, backend);
+                initial_table_size, num_threads, backend);
             last_found_count = benchmark_table(
                 table,
                 keys,
@@ -407,6 +431,7 @@ int main(int argc, char* argv[]) {
     const double max_time = arr_max(times, reps);
 
     std::printf("----------------------------------------\n");
+    std::printf("Initial size: %d\n", initial_table_size);
     std::printf("Mean time   : %.6f seconds (trimmed)\n", trimmed);
     std::printf("Std dev     : %.6f seconds\n", deviation);
     std::printf("Min time    : %.6f seconds\n", min_time);

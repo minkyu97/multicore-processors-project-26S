@@ -682,13 +682,10 @@ void test_resize_controls() {
 
     {
         LinearParallelTable table(8, 4, ParallelBackend::CAS);
-        bool threw = false;
-        try {
-            table.insert(-3, -30);
-        } catch (const std::invalid_argument&) {
-            threw = true;
-        }
-        TEST("Parallel CAS rejects the internal busy sentinel key", threw);
+        int value = 0;
+        table.insert(-3, -30);
+        TEST("Parallel CAS accepts ordinary negative keys once busy sentinel is removed",
+             table.get(-3, value) && value == -30);
     }
 }
 
