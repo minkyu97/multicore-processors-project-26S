@@ -15,6 +15,8 @@ constexpr int PROBE_QUADRATIC = 1;
 constexpr int IMPL_SEQUENTIAL = 0;
 constexpr int IMPL_PARALLEL_CAS = 1;
 constexpr int IMPL_PARALLEL_MUTEX = 2;
+constexpr int IMPL_SEGMENTED_CAS = 3;
+constexpr int IMPL_SEGMENTED_MUTEX = 4;
 
 constexpr int KEYS_SEQUENTIAL = 0;
 constexpr int KEYS_RANDOM = 1;
@@ -109,6 +111,10 @@ const char* implementation_name(int implementation) {
             return "Parallel (CAS)";
         case IMPL_PARALLEL_MUTEX:
             return "Parallel (mutex)";
+        case IMPL_SEGMENTED_CAS:
+            return "Segmented (CAS)";
+        case IMPL_SEGMENTED_MUTEX:
+            return "Segmented (mutex)";
         default:
             return "Unknown";
     }
@@ -139,8 +145,9 @@ const char* workload_name(int workload) {
 }
 
 ParallelBackend backend_for_mode(int implementation) {
-    return implementation == IMPL_PARALLEL_MUTEX ? ParallelBackend::MUTEX
-                                                 : ParallelBackend::CAS;
+    return implementation == IMPL_PARALLEL_MUTEX || implementation == IMPL_SEGMENTED_MUTEX
+        ? ParallelBackend::MUTEX
+        : ParallelBackend::CAS;
 }
 
 void generate_keys(std::vector<int>& keys, std::vector<int>& values, int table_size, int dist) {
@@ -224,8 +231,8 @@ int run_sequential_ops(Table& table,
     return found;
 }
 
-template <typename Probing>
-int run_parallel_ops(ParallelHashTable<int, int, Probing>& table,
+template <typename Table>
+int run_parallel_ops(Table& table,
                      const std::vector<int>& keys,
                      const std::vector<int>& values,
                      int num_threads) {
@@ -298,7 +305,8 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr,
                      "  table_size : slots in hash table (e.g. 1000000, 10000000)\n");
         std::fprintf(stderr, "  num_ops    : keys to insert/search\n");
-        std::fprintf(stderr, "  who        : 0=sequential, 1=parallel-cas, 2=parallel-mutex\n");
+        std::fprintf(stderr,
+                     "  who        : 0=sequential, 1=parallel-cas, 2=parallel-mutex, 3=segmented-cas, 4=segmented-mutex\n");
         std::fprintf(stderr, "  threads    : 1,2,4,8,16,32,64\n");
         std::fprintf(stderr, "  probing    : 0=linear, 1=quadratic\n");
         std::fprintf(stderr, "  key_dist   : 0=sequential, 1=random, 2=zipf\n");
@@ -320,8 +328,8 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr, "reps must be between 1 and %d\n", MAX_REPS);
         return 1;
     }
-    if (which_code < IMPL_SEQUENTIAL || which_code > IMPL_PARALLEL_MUTEX) {
-        std::fprintf(stderr, "who must be 0, 1, or 2\n");
+    if (which_code < IMPL_SEQUENTIAL || which_code > IMPL_SEGMENTED_MUTEX) {
+        std::fprintf(stderr, "who must be between 0 and 4\n");
         return 1;
     }
     if (probing != PROBE_LINEAR && probing != PROBE_QUADRATIC) {
@@ -390,33 +398,65 @@ int main(int argc, char* argv[]) {
         }
     } else {
         const ParallelBackend backend = backend_for_mode(which_code);
+        const bool use_segmented =
+            which_code == IMPL_SEGMENTED_CAS || which_code == IMPL_SEGMENTED_MUTEX;
 
         if (use_quadratic) {
-            ParallelHashTable<int, int, ProbingStrategy::QUADRATIC> table(
-                initial_table_size, num_threads, backend);
-            last_found_count = benchmark_table(
-                table,
-                keys,
-                values,
-                reps,
-                [num_threads](auto& current_table, const auto& current_keys, const auto& current_values) {
-                    return run_parallel_ops(current_table, current_keys, current_values, num_threads);
-                },
-                times);
-            mismatches = count_mismatches(table, keys);
+            if (use_segmented) {
+                SegmentedHashTable<int, int, ProbingStrategy::QUADRATIC> table(
+                    initial_table_size, num_threads, backend);
+                last_found_count = benchmark_table(
+                    table,
+                    keys,
+                    values,
+                    reps,
+                    [num_threads](auto& current_table, const auto& current_keys, const auto& current_values) {
+                        return run_parallel_ops(current_table, current_keys, current_values, num_threads);
+                    },
+                    times);
+                mismatches = count_mismatches(table, keys);
+            } else {
+                ParallelHashTable<int, int, ProbingStrategy::QUADRATIC> table(
+                    initial_table_size, num_threads, backend);
+                last_found_count = benchmark_table(
+                    table,
+                    keys,
+                    values,
+                    reps,
+                    [num_threads](auto& current_table, const auto& current_keys, const auto& current_values) {
+                        return run_parallel_ops(current_table, current_keys, current_values, num_threads);
+                    },
+                    times);
+                mismatches = count_mismatches(table, keys);
+            }
         } else {
-            ParallelHashTable<int, int, ProbingStrategy::LINEAR> table(
-                initial_table_size, num_threads, backend);
-            last_found_count = benchmark_table(
-                table,
-                keys,
-                values,
-                reps,
-                [num_threads](auto& current_table, const auto& current_keys, const auto& current_values) {
-                    return run_parallel_ops(current_table, current_keys, current_values, num_threads);
-                },
-                times);
-            mismatches = count_mismatches(table, keys);
+            if (use_segmented) {
+                SegmentedHashTable<int, int, ProbingStrategy::LINEAR> table(
+                    initial_table_size, num_threads, backend);
+                last_found_count = benchmark_table(
+                    table,
+                    keys,
+                    values,
+                    reps,
+                    [num_threads](auto& current_table, const auto& current_keys, const auto& current_values) {
+                        return run_parallel_ops(current_table, current_keys, current_values, num_threads);
+                    },
+                    times);
+                mismatches = count_mismatches(table, keys);
+            } else {
+                ParallelHashTable<int, int, ProbingStrategy::LINEAR> table(
+                    initial_table_size, num_threads, backend);
+                last_found_count = benchmark_table(
+                    table,
+                    keys,
+                    values,
+                    reps,
+                    [num_threads](auto& current_table, const auto& current_keys, const auto& current_values) {
+                        return run_parallel_ops(current_table, current_keys, current_values, num_threads);
+                    },
+                    times);
+                mismatches = count_mismatches(table, keys);
+            }
         }
 
         check_result(mismatches);

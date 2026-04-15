@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -140,6 +141,52 @@ namespace openmp_hash_table_detail {
     inline size_t cleanup_capacity(size_t current_capacity, size_t occupied) {
         return std::max(current_capacity, min_capacity_for_items(occupied));
     }
+
+    inline size_t ceil_div(size_t numerator, size_t denominator) {
+        return (numerator + denominator - 1) / denominator;
+    }
+
+    inline size_t largest_power_of_two_leq(size_t value) {
+        if (value <= 1) {
+            return 1;
+        }
+
+        size_t result = 1;
+        while (result <= value / 2) {
+            result *= 2;
+        }
+        return result;
+    }
+
+    inline size_t default_segment_count(size_t initial_capacity, size_t num_threads) {
+        const size_t thread_hint = std::max<size_t>(1, num_threads);
+        const size_t segment_limit = initial_capacity / 8;
+        if (segment_limit == 0) {
+            return 1;
+        }
+
+        return largest_power_of_two_leq(std::min(thread_hint * 2, segment_limit));
+    }
+
+    template <typename K>
+    size_t mix_hash_key(K key) {
+        std::uint64_t mixed = 0;
+        if constexpr (std::is_integral_v<K>) {
+            mixed = static_cast<std::uint64_t>(key);
+        } else {
+            mixed = static_cast<std::uint64_t>(std::hash<K>{}(key));
+        }
+
+        mixed += 0x9e3779b97f4a7c15ull;
+        mixed = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9ull;
+        mixed = (mixed ^ (mixed >> 27)) * 0x94d049bb133111ebull;
+        mixed ^= mixed >> 31;
+        return static_cast<size_t>(mixed);
+    }
+
+    inline size_t segment_index_from_hash(size_t mixed_hash, size_t segment_count) {
+        return segment_count == 1 ? 0 : (mixed_hash & (segment_count - 1));
+    }
 }
 
 template <typename K, typename V, typename Probing = ProbingStrategy::LINEAR>
@@ -264,6 +311,76 @@ public:
                       size_t num_threads = 0,
                       ParallelBackend backend = ParallelBackend::MUTEX);
     ~ParallelHashTable();
+
+    void clear();
+    size_t hash(K key) const;
+    size_t size() const;
+    size_t capacity() const;
+    float load_factor() const;
+    void reserve(size_t desired_items);
+    void rehash(size_t new_capacity);
+
+    bool insert(K key, V value);
+    bool get(K key, V& out_value);
+    bool remove(K key);
+
+    void insert_batch(const std::vector<K>& keys, const std::vector<V>& values);
+    void get_batch(const std::vector<K>& keys,
+                   std::vector<V>& out_values,
+                   std::vector<bool>& out_found);
+    void remove_batch(const std::vector<K>& keys);
+};
+
+template <typename K, typename V, typename Probing = ProbingStrategy::LINEAR>
+class SegmentedHashTable {
+private:
+    using SegmentTable = ParallelHashTable<K, V, Probing>;
+
+    class OperationGuard {
+    public:
+        explicit OperationGuard(const SegmentedHashTable& owner)
+            : owner_(owner), engaged_(false) {
+            owner_.enter_operation();
+            engaged_ = true;
+        }
+
+        ~OperationGuard() {
+            if (engaged_) {
+                owner_.leave_operation();
+            }
+        }
+
+        OperationGuard(const OperationGuard&) = delete;
+        OperationGuard& operator=(const OperationGuard&) = delete;
+
+    private:
+        const SegmentedHashTable& owner_;
+        bool engaged_;
+    };
+
+    std::vector<std::unique_ptr<SegmentTable>> segments_;
+    size_t num_threads_;
+    ParallelBackend backend_;
+    size_t segment_count_;
+    mutable std::atomic<bool> maintenance_mode_;
+    mutable std::atomic<size_t> active_operations_;
+
+    void enter_operation() const;
+    void leave_operation() const;
+    void wait_for_all_operations_to_finish() const;
+    void validate_insert_key(K key) const;
+    size_t mixed_hash(K key) const;
+    size_t segment_index_for_hash(size_t mixed_hash) const;
+    SegmentTable& segment_for_hash(size_t mixed_hash) const;
+    size_t size_unlocked() const;
+    size_t capacity_unlocked() const;
+    size_t per_segment_target_capacity(size_t total_target_capacity, size_t segment_live_items) const;
+
+public:
+    SegmentedHashTable(size_t size,
+                       size_t num_threads = 0,
+                       ParallelBackend backend = ParallelBackend::MUTEX);
+    ~SegmentedHashTable();
 
     void clear();
     size_t hash(K key) const;
@@ -1834,6 +1951,270 @@ void ParallelHashTable<K, V, P>::get_batch(const std::vector<K>& keys,
 
 template <typename K, typename V, typename P>
 void ParallelHashTable<K, V, P>::remove_batch(const std::vector<K>& keys) {
+    #pragma omp parallel for schedule(static) num_threads(num_threads_)
+    for (size_t i = 0; i < keys.size(); ++i) {
+        remove(keys[i]);
+    }
+}
+
+template <typename K, typename V, typename P>
+SegmentedHashTable<K, V, P>::SegmentedHashTable(size_t size,
+                                                size_t num_threads,
+                                                ParallelBackend backend)
+    : segments_(),
+      num_threads_(num_threads == 0 ? omp_get_max_threads() : num_threads),
+      backend_(backend),
+      segment_count_(openmp_hash_table_detail::default_segment_count(
+          size,
+          num_threads == 0 ? omp_get_max_threads() : num_threads)),
+      maintenance_mode_(false),
+      active_operations_(0) {
+    if (size == 0) {
+        throw std::invalid_argument("hash table size must be greater than zero");
+    }
+
+    const size_t initial_segment_capacity = std::max<size_t>(
+        8,
+        openmp_hash_table_detail::ceil_div(size, segment_count_));
+    segments_.reserve(segment_count_);
+    try {
+        for (size_t segment_index = 0; segment_index < segment_count_; ++segment_index) {
+            segments_.push_back(
+                std::make_unique<SegmentTable>(initial_segment_capacity, num_threads_, backend_));
+        }
+    } catch (...) {
+        segments_.clear();
+        throw;
+    }
+}
+
+template <typename K, typename V, typename P>
+SegmentedHashTable<K, V, P>::~SegmentedHashTable() {
+    maintenance_mode_.store(true, std::memory_order_release);
+    wait_for_all_operations_to_finish();
+    segments_.clear();
+}
+
+template <typename K, typename V, typename P>
+void SegmentedHashTable<K, V, P>::enter_operation() const {
+    for (;;) {
+        while (maintenance_mode_.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+
+        active_operations_.fetch_add(1, std::memory_order_acq_rel);
+        if (!maintenance_mode_.load(std::memory_order_acquire)) {
+            return;
+        }
+        active_operations_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+}
+
+template <typename K, typename V, typename P>
+void SegmentedHashTable<K, V, P>::leave_operation() const {
+    active_operations_.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+template <typename K, typename V, typename P>
+void SegmentedHashTable<K, V, P>::wait_for_all_operations_to_finish() const {
+    while (active_operations_.load(std::memory_order_acquire) != 0) {
+        std::this_thread::yield();
+    }
+}
+
+template <typename K, typename V, typename P>
+void SegmentedHashTable<K, V, P>::validate_insert_key(K key) const {
+    if (key == openmp_hash_table_detail::empty_key<K>() ||
+        key == openmp_hash_table_detail::deleted_key<K>()) {
+        throw std::invalid_argument("insert key collides with reserved sentinel value");
+    }
+}
+
+template <typename K, typename V, typename P>
+size_t SegmentedHashTable<K, V, P>::mixed_hash(K key) const {
+    return openmp_hash_table_detail::mix_hash_key(key);
+}
+
+template <typename K, typename V, typename P>
+size_t SegmentedHashTable<K, V, P>::segment_index_for_hash(size_t mixed_hash_value) const {
+    return openmp_hash_table_detail::segment_index_from_hash(mixed_hash_value, segment_count_);
+}
+
+template <typename K, typename V, typename P>
+typename SegmentedHashTable<K, V, P>::SegmentTable&
+SegmentedHashTable<K, V, P>::segment_for_hash(size_t mixed_hash_value) const {
+    return *segments_[segment_index_for_hash(mixed_hash_value)];
+}
+
+template <typename K, typename V, typename P>
+size_t SegmentedHashTable<K, V, P>::size_unlocked() const {
+    size_t total = 0;
+    for (const auto& segment : segments_) {
+        total += segment->size();
+    }
+    return total;
+}
+
+template <typename K, typename V, typename P>
+size_t SegmentedHashTable<K, V, P>::capacity_unlocked() const {
+    size_t total = 0;
+    for (const auto& segment : segments_) {
+        total += segment->capacity();
+    }
+    return total;
+}
+
+template <typename K, typename V, typename P>
+size_t SegmentedHashTable<K, V, P>::per_segment_target_capacity(size_t total_target_capacity,
+                                                                size_t segment_live_items) const {
+    return std::max(
+        openmp_hash_table_detail::ceil_div(total_target_capacity, segment_count_),
+        openmp_hash_table_detail::min_capacity_for_items(segment_live_items));
+}
+
+template <typename K, typename V, typename P>
+void SegmentedHashTable<K, V, P>::clear() {
+    maintenance_mode_.store(true, std::memory_order_release);
+    wait_for_all_operations_to_finish();
+
+    try {
+        for (const auto& segment : segments_) {
+            segment->clear();
+        }
+    } catch (...) {
+        maintenance_mode_.store(false, std::memory_order_release);
+        throw;
+    }
+
+    maintenance_mode_.store(false, std::memory_order_release);
+}
+
+template <typename K, typename V, typename P>
+size_t SegmentedHashTable<K, V, P>::hash(K key) const {
+    OperationGuard guard(*this);
+    const size_t mixed_hash_value = mixed_hash(key);
+    const size_t segment_index = segment_index_for_hash(mixed_hash_value);
+
+    size_t global_offset = 0;
+    for (size_t i = 0; i < segment_index; ++i) {
+        global_offset += segments_[i]->capacity();
+    }
+    return global_offset + segments_[segment_index]->hash(key);
+}
+
+template <typename K, typename V, typename P>
+size_t SegmentedHashTable<K, V, P>::size() const {
+    OperationGuard guard(*this);
+    return size_unlocked();
+}
+
+template <typename K, typename V, typename P>
+size_t SegmentedHashTable<K, V, P>::capacity() const {
+    OperationGuard guard(*this);
+    return capacity_unlocked();
+}
+
+template <typename K, typename V, typename P>
+float SegmentedHashTable<K, V, P>::load_factor() const {
+    OperationGuard guard(*this);
+    const size_t total_capacity = capacity_unlocked();
+    if (total_capacity == 0) {
+        return 0.0f;
+    }
+    return static_cast<float>(size_unlocked()) / static_cast<float>(total_capacity);
+}
+
+template <typename K, typename V, typename P>
+void SegmentedHashTable<K, V, P>::reserve(size_t desired_items) {
+    if (desired_items == 0) {
+        return;
+    }
+
+    OperationGuard guard(*this);
+    const size_t total_target_capacity =
+        openmp_hash_table_detail::min_capacity_for_items(desired_items);
+
+    for (const auto& segment : segments_) {
+        const size_t local_target_capacity =
+            per_segment_target_capacity(total_target_capacity, segment->size());
+        segment->rehash(std::max(segment->capacity(), local_target_capacity));
+    }
+}
+
+template <typename K, typename V, typename P>
+void SegmentedHashTable<K, V, P>::rehash(size_t new_capacity) {
+    if (new_capacity == 0) {
+        throw std::invalid_argument("rehash capacity must be greater than zero");
+    }
+
+    OperationGuard guard(*this);
+    const size_t total_live_items = size_unlocked();
+    const size_t total_target_capacity = std::max(
+        new_capacity,
+        openmp_hash_table_detail::min_capacity_for_items(total_live_items));
+
+    for (const auto& segment : segments_) {
+        segment->rehash(per_segment_target_capacity(total_target_capacity, segment->size()));
+    }
+}
+
+template <typename K, typename V, typename P>
+bool SegmentedHashTable<K, V, P>::insert(K key, V value) {
+    validate_insert_key(key);
+    OperationGuard guard(*this);
+    return segment_for_hash(mixed_hash(key)).insert(key, value);
+}
+
+template <typename K, typename V, typename P>
+bool SegmentedHashTable<K, V, P>::get(K key, V& out_value) {
+    OperationGuard guard(*this);
+    return segment_for_hash(mixed_hash(key)).get(key, out_value);
+}
+
+template <typename K, typename V, typename P>
+bool SegmentedHashTable<K, V, P>::remove(K key) {
+    OperationGuard guard(*this);
+    return segment_for_hash(mixed_hash(key)).remove(key);
+}
+
+template <typename K, typename V, typename P>
+void SegmentedHashTable<K, V, P>::insert_batch(const std::vector<K>& keys,
+                                               const std::vector<V>& values) {
+    if (keys.size() != values.size()) {
+        throw std::invalid_argument("keys and values must have the same length");
+    }
+
+    #pragma omp parallel for schedule(static) num_threads(num_threads_)
+    for (size_t i = 0; i < keys.size(); ++i) {
+        insert(keys[i], values[i]);
+    }
+}
+
+template <typename K, typename V, typename P>
+void SegmentedHashTable<K, V, P>::get_batch(const std::vector<K>& keys,
+                                            std::vector<V>& out_values,
+                                            std::vector<bool>& out_found) {
+    out_values.resize(keys.size());
+    std::vector<unsigned char> found_bits(keys.size(), 0);
+
+    #pragma omp parallel for schedule(static) num_threads(num_threads_)
+    for (size_t i = 0; i < keys.size(); ++i) {
+        V value{};
+        const bool found = get(keys[i], value);
+        found_bits[i] = found ? 1U : 0U;
+        if (found) {
+            out_values[i] = value;
+        }
+    }
+
+    out_found.assign(keys.size(), false);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        out_found[i] = found_bits[i] != 0;
+    }
+}
+
+template <typename K, typename V, typename P>
+void SegmentedHashTable<K, V, P>::remove_batch(const std::vector<K>& keys) {
     #pragma omp parallel for schedule(static) num_threads(num_threads_)
     for (size_t i = 0; i < keys.size(); ++i) {
         remove(keys[i]);

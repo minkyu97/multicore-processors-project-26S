@@ -21,6 +21,8 @@ using LinearSequentialTable = SequentialHashTable<int, int, ProbingStrategy::LIN
 using QuadraticSequentialTable = SequentialHashTable<int, int, ProbingStrategy::QUADRATIC>;
 using LinearParallelTable = ParallelHashTable<int, int, ProbingStrategy::LINEAR>;
 using QuadraticParallelTable = ParallelHashTable<int, int, ProbingStrategy::QUADRATIC>;
+using LinearSegmentedTable = SegmentedHashTable<int, int, ProbingStrategy::LINEAR>;
+using QuadraticSegmentedTable = SegmentedHashTable<int, int, ProbingStrategy::QUADRATIC>;
 
 int pass_count = 0;
 int fail_count = 0;
@@ -111,6 +113,33 @@ size_t resize_capacity_for_items(size_t items) {
         return 1;
     }
     return (items * 10 + 6) / 7;
+}
+
+size_t segmented_segment_count(size_t initial_capacity, size_t num_threads) {
+    return openmp_hash_table_detail::default_segment_count(initial_capacity, num_threads);
+}
+
+size_t segmented_index_for_key(int key, size_t initial_capacity, size_t num_threads) {
+    return openmp_hash_table_detail::segment_index_from_hash(
+        openmp_hash_table_detail::mix_hash_key(key),
+        segmented_segment_count(initial_capacity, num_threads));
+}
+
+std::vector<int> collect_keys_for_segment(size_t initial_capacity,
+                                          size_t num_threads,
+                                          size_t segment_index,
+                                          int key_count,
+                                          int start_key = 1) {
+    std::vector<int> keys;
+    keys.reserve(static_cast<std::size_t>(key_count));
+
+    for (int key = start_key; static_cast<int>(keys.size()) < key_count; ++key) {
+        if (segmented_index_for_key(key, initial_capacity, num_threads) == segment_index) {
+            keys.push_back(key);
+        }
+    }
+
+    return keys;
 }
 
 void generate_keys(int* keys, int* values, int num_ops, int table_size, int dist) {
@@ -755,8 +784,147 @@ void test_parallel_resize_stress() {
     run_parallel_resize_stress_case("Mutex resize stress", ParallelBackend::MUTEX, 64);
 }
 
+template <typename Table>
+void run_segmented_resize_stress_case(const char* label_prefix,
+                                      size_t initial_capacity,
+                                      int num_threads,
+                                      ParallelBackend backend) {
+    const size_t segment_count = segmented_segment_count(initial_capacity, num_threads);
+
+    TEST("Segmented test setup creates multiple segments", segment_count > 1);
+    if (segment_count < 2) {
+        return;
+    }
+
+    Table table(initial_capacity, num_threads, backend);
+    const auto hot_keys = collect_keys_for_segment(initial_capacity, num_threads, 0, 96);
+    const auto cold_keys = collect_keys_for_segment(initial_capacity, num_threads, 1, 32, 20000);
+
+    for (int key : cold_keys) {
+        table.insert(key, key * 10);
+    }
+
+    std::atomic<int> wrong_values{0};
+
+    #pragma omp parallel num_threads(num_threads)
+    {
+        const int tid = omp_get_thread_num();
+        const int keys_per_thread = static_cast<int>(hot_keys.size()) / num_threads;
+        const int begin = tid * keys_per_thread;
+        const int end = begin + keys_per_thread;
+
+        for (int i = begin; i < end; ++i) {
+            const int key = hot_keys[static_cast<std::size_t>(i)];
+            table.insert(key, key * 10);
+
+            if ((i - begin) % 8 == 0) {
+                table.reserve(static_cast<size_t>(hot_keys.size() + cold_keys.size() + i + 1));
+            }
+            if (tid == 0 && (i - begin) % 12 == 0) {
+                table.rehash(table.capacity());
+            }
+            if ((i - begin) % 10 == 0) {
+                const int recycled_key = hot_keys[static_cast<std::size_t>(begin)];
+                table.remove(recycled_key);
+                table.insert(recycled_key, recycled_key * 10);
+            }
+
+            int value = 0;
+            if (table.get(key, value) && value != key * 10) {
+                wrong_values.fetch_add(1);
+            }
+
+            const int cold_key = cold_keys[static_cast<std::size_t>((tid + i) % cold_keys.size())];
+            if (table.get(cold_key, value) && value != cold_key * 10) {
+                wrong_values.fetch_add(1);
+            }
+        }
+    }
+
+    int missing = 0;
+    int value_mismatches = 0;
+    for (int key : hot_keys) {
+        int value = 0;
+        if (!table.get(key, value)) {
+            ++missing;
+            continue;
+        }
+        if (value != key * 10) {
+            ++value_mismatches;
+        }
+    }
+
+    for (int key : cold_keys) {
+        int value = 0;
+        if (!table.get(key, value)) {
+            ++missing;
+            continue;
+        }
+        if (value != key * 10) {
+            ++value_mismatches;
+        }
+    }
+
+    char label[128];
+    std::snprintf(label, sizeof(label), "%s preserves hot and cold segment keys", label_prefix);
+    TEST(label, missing == 0 && value_mismatches == 0 && wrong_values.load() == 0);
+
+    std::snprintf(label, sizeof(label), "%s grows total capacity under segment-local resize", label_prefix);
+    TEST(label, table.capacity() >= initial_capacity && table.size() == hot_keys.size() + cold_keys.size());
+}
+
+void test_segmented_hash_table() {
+    SECTION("11. Segmented Hash Table");
+    const size_t initial_capacity = 128;
+    const int num_threads = 8;
+
+    {
+        LinearSegmentedTable table(64, 4, ParallelBackend::CAS);
+        TEST("Segmented initial capacity rounds to at least requested slots", table.capacity() >= 64);
+
+        for (int i = 1; i <= 24; ++i) {
+            table.insert(i, i * 10);
+        }
+
+        TEST("Segmented CAS preserves inserted keys",
+             table.size() == 24 && table_contains(table, 1) && table_contains(table, 24));
+
+        table.reserve(64);
+        TEST("Segmented reserve grows total capacity to requested target",
+             table.capacity() >= resize_capacity_for_items(64));
+
+        table.rehash(32);
+        TEST("Segmented rehash preserves live keys while allowing rounded capacity",
+             table.capacity() >= resize_capacity_for_items(24) &&
+             table_contains(table, 1) && table_contains(table, 24));
+    }
+
+    {
+        QuadraticSegmentedTable table(64, 4, ParallelBackend::MUTEX);
+        int value = 0;
+        table.insert(1, 10);
+        table.remove(1);
+        table.insert(1, 100);
+        table.insert(-3, -30);
+
+        TEST("Segmented mutex delete and reinsert preserves replacement value",
+             table.get(1, value) && value == 100);
+        TEST("Segmented mutex accepts ordinary negative keys",
+             table.get(-3, value) && value == -30);
+    }
+
+    run_segmented_resize_stress_case<LinearSegmentedTable>(
+        "Segmented linear CAS stress", initial_capacity, num_threads, ParallelBackend::CAS);
+    run_segmented_resize_stress_case<LinearSegmentedTable>(
+        "Segmented linear mutex stress", initial_capacity, num_threads, ParallelBackend::MUTEX);
+    run_segmented_resize_stress_case<QuadraticSegmentedTable>(
+        "Segmented quadratic CAS stress", initial_capacity, num_threads, ParallelBackend::CAS);
+    run_segmented_resize_stress_case<QuadraticSegmentedTable>(
+        "Segmented quadratic mutex stress", initial_capacity, num_threads, ParallelBackend::MUTEX);
+}
+
 void test_statistics() {
-    SECTION("11. Statistics Helpers");
+    SECTION("12. Statistics Helpers");
 
     const double arr1[] = {1.0, 2.0, 3.0, 4.0, 5.0};
     TEST("mean([1,2,3,4,5]) == 3.0", std::fabs(mean_fn(arr1, 5) - 3.0) < 1e-9);
@@ -787,7 +955,7 @@ void test_statistics() {
 }
 
 void test_performance_sanity() {
-    SECTION("12. Performance Sanity Checks");
+    SECTION("13. Performance Sanity Checks");
 
     const int table_size = 1000000;
     const int num_ops = 500000;
@@ -839,6 +1007,7 @@ int main() {
     test_edge_cases();
     test_resize_controls();
     test_parallel_resize_stress();
+    test_segmented_hash_table();
     test_statistics();
     test_performance_sanity();
 

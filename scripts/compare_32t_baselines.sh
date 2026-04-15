@@ -41,6 +41,8 @@ Output:
   <output-dir>/logs/absl_flat_hash_map.log (if available)
   <output-dir>/logs/custom_cas_t{threads}.log
   <output-dir>/logs/custom_mutex_t{threads}.log
+  <output-dir>/logs/segmented_cas_t{threads}.log
+  <output-dir>/logs/segmented_mutex_t{threads}.log
 EOF
 }
 
@@ -152,6 +154,8 @@ STD_LOG="$OUTPUT_DIR/logs/std_unordered_map.log"
 ABSL_LOG="$OUTPUT_DIR/logs/absl_flat_hash_map.log"
 CAS_LOG="$OUTPUT_DIR/logs/custom_cas_t${THREADS}.log"
 MUTEX_LOG="$OUTPUT_DIR/logs/custom_mutex_t${THREADS}.log"
+SEGMENTED_CAS_LOG="$OUTPUT_DIR/logs/segmented_cas_t${THREADS}.log"
+SEGMENTED_MUTEX_LOG="$OUTPUT_DIR/logs/segmented_mutex_t${THREADS}.log"
 
 echo "Running custom sequential baseline..."
 "$CUSTOM_BENCH_BIN" "$TABLE_SIZE" "$OPS" 0 1 "$PROBING" "$KEY_DIST" "$REPS" | tee "$CUSTOM_SEQ_LOG"
@@ -164,6 +168,12 @@ echo "Running custom CAS benchmark with ${THREADS} thread(s)..."
 
 echo "Running custom mutex benchmark with ${THREADS} thread(s)..."
 "$CUSTOM_BENCH_BIN" "$TABLE_SIZE" "$OPS" 2 "$THREADS" "$PROBING" "$KEY_DIST" "$REPS" | tee "$MUTEX_LOG"
+
+echo "Running segmented CAS benchmark with ${THREADS} thread(s)..."
+"$CUSTOM_BENCH_BIN" "$TABLE_SIZE" "$OPS" 3 "$THREADS" "$PROBING" "$KEY_DIST" "$REPS" | tee "$SEGMENTED_CAS_LOG"
+
+echo "Running segmented mutex benchmark with ${THREADS} thread(s)..."
+"$CUSTOM_BENCH_BIN" "$TABLE_SIZE" "$OPS" 4 "$THREADS" "$PROBING" "$KEY_DIST" "$REPS" | tee "$SEGMENTED_MUTEX_LOG"
 
 HAS_ABSL="$("$BASELINE_BENCH_BIN" --has-absl)"
 ABSL_AVAILABLE=0
@@ -232,6 +242,8 @@ else
 fi
 append_row "Custom CAS" "$THREADS" "$CAS_LOG" "$STD_MEAN" "$ABSL_MEAN"
 append_row "Custom Mutex" "$THREADS" "$MUTEX_LOG" "$STD_MEAN" "$ABSL_MEAN"
+append_row "Segmented CAS" "$THREADS" "$SEGMENTED_CAS_LOG" "$STD_MEAN" "$ABSL_MEAN"
+append_row "Segmented Mutex" "$THREADS" "$SEGMENTED_MUTEX_LOG" "$STD_MEAN" "$ABSL_MEAN"
 
 echo
 echo "Saved summary to: $SUMMARY_FILE"
