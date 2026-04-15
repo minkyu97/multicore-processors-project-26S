@@ -106,6 +106,13 @@ double trimmed_mean(const double* arr, int n) {
     return count > 0 ? sum / count : mean_fn(arr, n);
 }
 
+size_t resize_capacity_for_items(size_t items) {
+    if (items == 0) {
+        return 1;
+    }
+    return (items * 10 + 6) / 7;
+}
+
 void generate_keys(int* keys, int* values, int num_ops, int table_size, int dist) {
     switch (dist) {
         case KEYS_SEQUENTIAL:
@@ -591,8 +598,168 @@ void test_edge_cases() {
     }
 }
 
+void test_resize_controls() {
+    SECTION("9. Resize Controls");
+
+    {
+        LinearSequentialTable table(8);
+        TEST("Sequential initial capacity is preserved", table.capacity() == 8);
+        TEST("Sequential initial load factor is 0.0", std::fabs(table.load_factor()) < 1e-9f);
+
+        for (int i = 1; i <= 6; ++i) {
+            table.insert(i, i * 10);
+        }
+
+        TEST("Sequential auto-resize grows capacity", table.capacity() > 8);
+        TEST("Sequential auto-resize keeps load factor under threshold", table.load_factor() < 0.71f);
+    }
+
+    {
+        LinearSequentialTable table(8);
+        for (int i = 1; i <= 4; ++i) {
+            table.insert(i, i * 10);
+        }
+
+        table.reserve(20);
+        TEST("Sequential reserve grows to requested capacity target",
+             table.capacity() >= resize_capacity_for_items(20));
+
+        table.rehash(5);
+        TEST("Sequential rehash can shrink while preserving live keys",
+             table.capacity() == resize_capacity_for_items(4) &&
+             table_contains(table, 1) && table_contains(table, 4));
+        TEST("Sequential rehash preserves values", table_get(table, 4) == 40);
+    }
+
+    {
+        LinearParallelTable table(8, 4, ParallelBackend::CAS);
+        TEST("Parallel initial capacity is preserved", table.capacity() == 8);
+
+        for (int i = 1; i <= 6; ++i) {
+            table.insert(i, i * 10);
+        }
+
+        TEST("Parallel CAS auto-resize grows capacity", table.capacity() > 8);
+        TEST("Parallel CAS auto-resize preserves inserted keys",
+             table.size() == 6 && table_contains(table, 1) && table_contains(table, 6));
+
+        table.reserve(20);
+        TEST("Parallel reserve grows to requested capacity target",
+             table.capacity() >= resize_capacity_for_items(20));
+
+        table.rehash(5);
+        TEST("Parallel rehash can shrink while preserving live keys",
+             table.capacity() == resize_capacity_for_items(6) &&
+             table_contains(table, 1) && table_contains(table, 6));
+    }
+
+    {
+        LinearParallelTable table(8, 4, ParallelBackend::MUTEX);
+        for (int i = 1; i <= 6; ++i) {
+            table.insert(i, i * 10);
+        }
+
+        const size_t before = table.capacity();
+        for (int i = 1; i <= 4; ++i) {
+            table.remove(i);
+        }
+        table.rehash(before);
+
+        TEST("Parallel mutex rehash clears tombstones without losing live keys",
+             table.capacity() == before && table.size() == 2 &&
+             table_contains(table, 5) && table_contains(table, 6));
+    }
+
+    {
+        LinearParallelTable table(8, 4, ParallelBackend::CAS);
+        int value = 0;
+        table.insert(1, 10);
+        table.remove(1);
+        table.insert(1, 100);
+        TEST("Parallel CAS delete and reinsert preserves the replacement value",
+             table.get(1, value) && value == 100);
+    }
+
+    {
+        LinearParallelTable table(8, 4, ParallelBackend::CAS);
+        bool threw = false;
+        try {
+            table.insert(-3, -30);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        TEST("Parallel CAS rejects the internal busy sentinel key", threw);
+    }
+}
+
+void run_parallel_resize_stress_case(const char* label_prefix,
+                                     ParallelBackend backend,
+                                     int keys_per_thread) {
+    const int num_threads = 8;
+    const int initial_capacity = 32;
+    const int total_keys = num_threads * keys_per_thread;
+
+    LinearParallelTable table(initial_capacity, num_threads, backend);
+    std::atomic<int> wrong_values{0};
+
+    #pragma omp parallel num_threads(num_threads)
+    {
+        const int tid = omp_get_thread_num();
+        for (int i = 0; i < keys_per_thread; ++i) {
+            const int key = tid * keys_per_thread + i + 1;
+            table.insert(key, key * 10);
+
+            if (i % 16 == 0) {
+                table.reserve(static_cast<size_t>(total_keys + i + 1));
+            }
+            if (tid == 0 && i % 24 == 0) {
+                table.rehash(table.capacity());
+            }
+            if (i % 20 == 0) {
+                const int recycled_key = tid * keys_per_thread + 1;
+                table.remove(recycled_key);
+                table.insert(recycled_key, recycled_key * 10);
+            }
+
+            int value = 0;
+            if (table.get(key, value) && value != key * 10) {
+                wrong_values.fetch_add(1);
+            }
+        }
+    }
+
+    int missing = 0;
+    int value_mismatches = 0;
+    for (int key = 1; key <= total_keys; ++key) {
+        int value = 0;
+        if (!table.get(key, value)) {
+            ++missing;
+            continue;
+        }
+        if (value != key * 10) {
+            ++value_mismatches;
+        }
+    }
+
+    char label[96];
+    std::snprintf(label, sizeof(label), "%s preserves all inserted keys", label_prefix);
+    TEST(label,
+         missing == 0 && value_mismatches == 0 &&
+         wrong_values.load() == 0 && count_occupied(table) == total_keys);
+
+    std::snprintf(label, sizeof(label), "%s grows capacity under concurrent resize", label_prefix);
+    TEST(label, table.capacity() > static_cast<size_t>(initial_capacity));
+}
+
+void test_parallel_resize_stress() {
+    SECTION("10. Concurrent Resize Stress");
+
+    run_parallel_resize_stress_case("CAS resize stress", ParallelBackend::CAS, 96);
+    run_parallel_resize_stress_case("Mutex resize stress", ParallelBackend::MUTEX, 64);
+}
+
 void test_statistics() {
-    SECTION("9. Statistics Helpers");
+    SECTION("11. Statistics Helpers");
 
     const double arr1[] = {1.0, 2.0, 3.0, 4.0, 5.0};
     TEST("mean([1,2,3,4,5]) == 3.0", std::fabs(mean_fn(arr1, 5) - 3.0) < 1e-9);
@@ -623,7 +790,7 @@ void test_statistics() {
 }
 
 void test_performance_sanity() {
-    SECTION("10. Performance Sanity Checks");
+    SECTION("12. Performance Sanity Checks");
 
     const int table_size = 1000000;
     const int num_ops = 500000;
@@ -673,6 +840,8 @@ int main() {
     test_parallel_correctness();
     test_thread_scaling_correctness();
     test_edge_cases();
+    test_resize_controls();
+    test_parallel_resize_stress();
     test_statistics();
     test_performance_sanity();
 
