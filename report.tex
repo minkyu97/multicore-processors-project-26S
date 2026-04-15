@@ -24,7 +24,7 @@
   captionpos=b
 }
 
-\title{\vspace{-2em}A Concurrent Open-Addressing Hash Table:\\
+\title{\vspace{-2em}A Parallel Open-Addressing Hash Table:\\
 Lock-Free CAS vs.\ Fine-Grained Mutex Under Contention}
 
 \author{%
@@ -268,8 +268,8 @@ cache locality. We evaluate both.
 \subsection{Batch operations}
 The high-throughput API consists of \texttt{insert\_batch},
 \texttt{get\_batch}, and \texttt{remove\_batch}, each of which
-dispatches an \texttt{\#pragma omp parallel for schedule(static)}
-across the user-provided arrays. Static scheduling was deliberate:
+dispatches an \texttt{\#pragma~omp~parallel~for}
+\texttt{schedule(static)} across the user-provided arrays. Static scheduling was deliberate:
 with uniform-random keys, each iteration has approximately equal
 cost, and static scheduling avoids the per-chunk synchronization of
 dynamic scheduling. For Zipf workloads the cost is skewed, but the
