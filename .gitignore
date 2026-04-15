@@ -5,3 +5,4 @@ build/
 CMakeUserPresets.json
 benchmark_results/
 out/
+*.zip
